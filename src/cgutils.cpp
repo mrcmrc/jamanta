@@ -28,46 +28,78 @@ static Instruction *tbaa_decorate(MDNode* md, Instruction* load_or_store)
 }
 
 // Fixing up references to other modules for MCJIT
+std::set<llvm::GlobalValue*> pending_globals;
 static GlobalVariable *prepare_global(GlobalVariable *G)
 {
-#ifdef USE_MCJIT
-    if (G->getParent() != jl_Module) {
-        GlobalVariable *gv = jl_Module->getGlobalVariable(G->getName());
-        if (!gv) {
-            gv = new GlobalVariable(*jl_Module, G->getType()->getElementType(),
-                                    G->isConstant(), GlobalVariable::ExternalLinkage,
-                                    NULL, G->getName(), NULL, G->getThreadLocalMode());
-        }
-        return gv;
-    }
-#endif
+    pending_globals.insert(G);
     return G;
 }
 
 static llvm::Value *prepare_call(llvm::Value* Callee)
 {
-#ifdef USE_MCJIT
     llvm::Function *F = dyn_cast<Function>(Callee);
     if (!F)
         return Callee;
-    if (F->getParent() != jl_Module) {
-        Function *ModuleF = jl_Module->getFunction(F->getName());
-        if (ModuleF) {
-            return ModuleF;
-        }
-        else {
-            Function *func = Function::Create(F->getFunctionType(),
-                                              Function::ExternalLinkage,
-                                              F->getName(),
-                                              jl_Module);
-            func->setAttributes(AttributeSet());
-            func->copyAttributesFrom(F);
-            return func;
-        }
-    }
-#endif
+    pending_globals.insert(F);
     return Callee;
 }
+
+
+// RAUW, but only for those users which live in a module, and create a module
+// specific copy
+static void realize_pending_globals()
+{
+    std::set<llvm::GlobalValue *> local_pending_globals;
+    std::swap(local_pending_globals,pending_globals);
+    for (auto *G : local_pending_globals) {
+        std::map<llvm::Module*,llvm::Value*> FixedGlobals;
+        Value::use_iterator UI = G->use_begin(), E = G->use_end();
+        for (; UI != E;) {
+            Use &Use = *UI;
+            ++UI;
+            Instruction *User = dyn_cast<Instruction>(Use.getUser());
+            if (!User)
+                continue;
+            Function *UsedInHere = User->getParent()->getParent();
+            assert(UsedInHere);
+            Module *M = UsedInHere->getParent();
+            if (M == G->getParent()) // can happen during bootstrap
+                continue;
+            // If we come across a function that is still being constructed,
+            // this use needs to remain pending
+            if (!M || M == builtins_module) {
+                pending_globals.insert(G);
+                continue;
+            }
+            if (!FixedGlobals.count(M)) {
+                if (auto *GV = dyn_cast<GlobalVariable>(G)) {
+                    GlobalVariable *NewGV = M->getGlobalVariable(GV->getName());
+                    if (!NewGV) {
+                        NewGV = new GlobalVariable(*M, GV->getType()->getElementType(),
+                                                GV->isConstant(), GlobalVariable::ExternalLinkage,
+                                                NULL, GV->getName(), NULL, GV->getThreadLocalMode());
+                    }
+                    FixedGlobals[M] = NewGV;
+                } else {
+                    Function *F = dyn_cast<Function>(G);
+                    if (!F->getParent())
+                        continue;
+                    assert(F);
+                    Function *NewF = M->getFunction(F->getName());
+                    if (!NewF) {
+                        NewF = Function::Create(F->getFunctionType(),
+                                    Function::ExternalLinkage,
+                                    F->getName(),
+                                    M);
+                    }
+                    FixedGlobals[M] = NewF;
+                }
+            }
+            Use.set(FixedGlobals[M]);
+        }
+    }
+}
+
 
 #ifdef LLVM35
 static inline void add_named_global(GlobalObject *gv, void *addr, bool dllimport = true)
@@ -135,7 +167,7 @@ static GlobalVariable *stringConst(const std::string &txt)
         ssno << strno;
         vname += "_j_str";
         vname += ssno.str();
-        gv = new GlobalVariable(*jl_Module,
+        gv = new GlobalVariable(*active_module,
                                 ArrayType::get(T_int8, txt.length()+1),
                                 true,
                                 imaging_mode ? GlobalVariable::PrivateLinkage : GlobalVariable::ExternalLinkage,
@@ -633,12 +665,12 @@ static Value *julia_gv(const char *cname, void *addr)
     // first see if there already is a GlobalVariable for this address
     it = jl_value_to_llvm.find(addr);
     if (it != jl_value_to_llvm.end())
-        return builder.CreateLoad(it->second.gv);
+        return builder.CreateLoad(prepare_global((llvm::GlobalVariable*)it->second.gv));
 
     std::stringstream gvname;
     gvname << cname << globalUnique++;
     // no existing GlobalVariable, create one and store it
-    GlobalVariable *gv = new GlobalVariable(*jl_Module, T_pjlvalue,
+    GlobalVariable *gv = new GlobalVariable(imaging_mode ? *shadow_module : *builtins_module, T_pjlvalue,
                            false, imaging_mode ? GlobalVariable::InternalLinkage : GlobalVariable::ExternalLinkage,
                            ConstantPointerNull::get((PointerType*)T_pjlvalue), gvname.str());
     addComdat(gv);
@@ -653,7 +685,7 @@ static Value *julia_gv(const char *cname, void *addr)
     // make the pointer valid for future sessions
     jl_sysimg_gvars.push_back(ConstantExpr::getBitCast(gv, T_psize));
     jl_value_llvm gv_struct;
-    gv_struct.gv = gv;
+    gv_struct.gv = prepare_global(gv);
     gv_struct.index = jl_sysimg_gvars.size();
     jl_value_to_llvm[addr] = gv_struct;
     return builder.CreateLoad(gv);
