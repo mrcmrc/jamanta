@@ -85,19 +85,20 @@ static Value *runtime_sym_lookup(PointerType *funcptype, const char *f_lib, cons
                *ccall_bb = BasicBlock::Create(jl_LLVMContext, "ccall");
     builder.CreateCondBr(builder.CreateICmpNE(builder.CreateLoad(llvmgv), initnul), ccall_bb, dlsym_lookup);
 
+    assert(ctx->f->getParent() != nullptr);
     ctx->f->getBasicBlockList().push_back(dlsym_lookup);
     builder.SetInsertPoint(dlsym_lookup);
     Value *libname;
     if (runtime_lib) {
-        libname = builder.CreateGlobalStringPtr(f_lib);
+        libname = CreateGlobalStringPtr(&builder,f_lib, "f_lib");
     }
     else {
         libname = literal_static_pointer_val(f_lib, T_pint8);
     }
 #ifdef LLVM37
-    Value *llvmf = builder.CreateCall(prepare_call(jldlsym_func), { libname, builder.CreateGlobalStringPtr(f_name), libptrgv });
+    Value *llvmf = builder.CreateCall(prepare_call(jldlsym_func), { libname, CreateGlobalStringPtr(&builder, f_name, "f_name"), libptrgv });
 #else
-    Value *llvmf = builder.CreateCall3(prepare_call(jldlsym_func), libname, builder.CreateGlobalStringPtr(f_name), libptrgv);
+    Value *llvmf = builder.CreateCall3(prepare_call(jldlsym_func), libname, CreateGlobalStringPtr(&builder, f_name, "f_name"), libptrgv);
 #endif
     builder.CreateStore(llvmf, llvmgv);
     builder.CreateBr(ccall_bb);

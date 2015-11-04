@@ -1,5 +1,7 @@
 // This file is a part of Julia. License is MIT: http://julialang.org/license
 
+#include <iostream>
+
 // utility procedures used in code generation
 
 template<class T> // for GlobalObject's
@@ -27,6 +29,30 @@ static Instruction *tbaa_decorate(MDNode* md, Instruction* load_or_store)
     return load_or_store;
 }
 
+GlobalVariable *IRBuilderBase::CreateGlobalString(StringRef Str,
+                                                  const Twine &Name,
+                                                  unsigned AddressSpace) {
+  Constant *StrConstant = ConstantDataArray::getString(jl_LLVMContext, Str);
+  GlobalVariable *GV = new GlobalVariable(*active_module, StrConstant->getType(),
+                                          true, GlobalValue::PrivateLinkage,
+                                          StrConstant, Name, nullptr,
+                                          GlobalVariable::NotThreadLocal,
+                                          AddressSpace);
+  GV->setUnnamedAddr(true);
+  return GV;
+}
+
+/// \brief Same as CreateGlobalString, but return a pointer with "i8*" type
+/// instead of a pointer to array of i8.
+Value *CreateGlobalStringPtr(llvm::IRBuilder<> *Builder, StringRef Str, const Twine &Name = "",
+                           unsigned AddressSpace = 0) {
+    GlobalVariable *gv = Builder->CreateGlobalString(Str, Name, AddressSpace);
+    Value *zero = ConstantInt::get(Type::getInt32Ty(jl_LLVMContext), 0);
+    Value *Args[] = { zero, zero };
+    return Builder->CreateInBoundsGEP(gv->getValueType(), gv, Args, Name);
+}
+
+
 // Fixing up references to other modules for MCJIT
 std::set<llvm::GlobalValue*> pending_globals;
 static GlobalVariable *prepare_global(GlobalVariable *G)
@@ -44,6 +70,53 @@ static llvm::Value *prepare_call(llvm::Value* Callee)
     return Callee;
 }
 
+static GlobalValue *realize_pending_global(Instruction *User, GlobalValue *G, std::map<llvm::Module*,llvm::GlobalValue*> &FixedGlobals)
+{
+    Function *UsedInHere = User->getParent()->getParent();
+    assert(UsedInHere);
+    Module *M = UsedInHere->getParent();
+    if (M == G->getParent() && M != builtins_module) { // can happen during bootstrap
+        //std::cout << "Skipping " << std::string(G->getName()) << " due to parentage" << std::endl;
+        return nullptr;
+    }
+    // If we come across a function that is still being constructed,
+    // this use needs to remain pending
+    if (!M || M == builtins_module) {
+        pending_globals.insert(G);
+        //std::cout << "Skipping " << std::string(G->getName()) << " due to construction" << std::endl;
+        return nullptr;
+    }
+    if (!FixedGlobals.count(M)) {
+        if (auto *GV = dyn_cast<GlobalVariable>(G)) {
+            GlobalVariable *NewGV = M->getGlobalVariable(GV->getName());
+            if (!NewGV) {
+                NewGV = new GlobalVariable(*M, GV->getType()->getElementType(),
+                                        GV->isConstant(), GlobalVariable::ExternalLinkage,
+                                        NULL, GV->getName(), NULL, GV->getThreadLocalMode());
+            }
+            FixedGlobals[M] = NewGV;
+        } else {
+            Function *F = dyn_cast<Function>(G);
+            //std::cout << "Realizing " << std::string(F->getName()) << std::endl;
+            if (!F->getParent()) {
+                //std::cout << "Skipping" << std::endl;
+                return nullptr;
+            }
+            assert(F);
+            Function *NewF = M->getFunction(F->getName());
+            if (!NewF) {
+                NewF = Function::Create(F->getFunctionType(),
+                            Function::ExternalLinkage,
+                            F->getName(),
+                            M);
+            } else {
+                std::cout << "Already there" << std::endl;
+            }
+            FixedGlobals[M] = NewF;
+        }
+    }
+    return FixedGlobals[M];
+}
 
 // RAUW, but only for those users which live in a module, and create a module
 // specific copy
@@ -51,51 +124,36 @@ static void realize_pending_globals()
 {
     std::set<llvm::GlobalValue *> local_pending_globals;
     std::swap(local_pending_globals,pending_globals);
+    GlobalValue *Replacement;
     for (auto *G : local_pending_globals) {
-        std::map<llvm::Module*,llvm::Value*> FixedGlobals;
+        std::map<llvm::Module*,llvm::GlobalValue*> FixedGlobals;
         Value::use_iterator UI = G->use_begin(), E = G->use_end();
         for (; UI != E;) {
-            Use &Use = *UI;
+            Use &Use1 = *UI;
             ++UI;
-            Instruction *User = dyn_cast<Instruction>(Use.getUser());
-            if (!User)
-                continue;
-            Function *UsedInHere = User->getParent()->getParent();
-            assert(UsedInHere);
-            Module *M = UsedInHere->getParent();
-            if (M == G->getParent()) // can happen during bootstrap
-                continue;
-            // If we come across a function that is still being constructed,
-            // this use needs to remain pending
-            if (!M || M == builtins_module) {
-                pending_globals.insert(G);
-                continue;
-            }
-            if (!FixedGlobals.count(M)) {
-                if (auto *GV = dyn_cast<GlobalVariable>(G)) {
-                    GlobalVariable *NewGV = M->getGlobalVariable(GV->getName());
-                    if (!NewGV) {
-                        NewGV = new GlobalVariable(*M, GV->getType()->getElementType(),
-                                                GV->isConstant(), GlobalVariable::ExternalLinkage,
-                                                NULL, GV->getName(), NULL, GV->getThreadLocalMode());
-                    }
-                    FixedGlobals[M] = NewGV;
-                } else {
-                    Function *F = dyn_cast<Function>(G);
-                    if (!F->getParent())
+            Instruction *User = dyn_cast<Instruction>(Use1.getUser());
+            if (!User) {
+                // Handle bit casts
+                ConstantExpr *Expr = dyn_cast<ConstantExpr>(Use1.getUser());
+                assert(Expr);
+                assert(Expr->getNumOperands() == 1);
+                Value::use_iterator UI2 = Expr->use_begin(), E2 = Expr->use_end();
+                for (; UI2 != E2;) {
+                    Use &Use2 = *UI2;
+                    ++UI2;
+                    Instruction *User2 = dyn_cast<Instruction>(Use2.getUser());
+                    assert(User2);
+                    Replacement = realize_pending_global(User2,G,FixedGlobals);
+                    if (!Replacement)
                         continue;
-                    assert(F);
-                    Function *NewF = M->getFunction(F->getName());
-                    if (!NewF) {
-                        NewF = Function::Create(F->getFunctionType(),
-                                    Function::ExternalLinkage,
-                                    F->getName(),
-                                    M);
-                    }
-                    FixedGlobals[M] = NewF;
+                    Use2.set(Expr->getWithOperandReplaced(0,Replacement));
                 }
+                continue;
             }
-            Use.set(FixedGlobals[M]);
+            Replacement = realize_pending_global(User,G,FixedGlobals);
+            if (!Replacement)
+                continue;
+            Use1.set(Replacement);
         }
     }
 }
@@ -545,6 +603,10 @@ static void jl_gen_llvm_globaldata(llvm::Module *mod, ValueToValueMapTy &VMap, c
 
 static void jl_dump_shadow(char *fname, int jit_model, const char *sysimg_data, size_t sysimg_len, bool dump_as_bc)
 {
+    realize_pending_globals();
+    //shadow_module->dump();
+    verifyModule(*shadow_module);
+
 #ifdef LLVM36
     std::error_code err;
     StringRef fname_ref = StringRef(fname);
