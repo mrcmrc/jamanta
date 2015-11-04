@@ -1055,6 +1055,8 @@ static uint64_t getAddressForOrCompileFunction(llvm::Function *llvmf)
     if (!imaging_mode) {
         realize_pending_globals();
         jl_finalize_module(active_module);
+        for (auto &F : active_module->functions())
+            FPM->run(F);
     }
     addr = jl_ExecutionEngine->getFunctionAddress(llvmf->getName());
     if (!imaging_mode) {

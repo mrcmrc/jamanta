@@ -648,7 +648,7 @@ static jl_cgval_t emit_llvmcall(jl_value_t **args, size_t nargs, jl_codectx_t *c
         Module *m = NULL;
         bool failed = parseAssemblyInto(llvm::MemoryBufferRef(ir_string,"llvmcall"),*active_module,Err);
         if (!failed)
-            m = jl_Module;
+            m = active_module;
 #else
         Module *m = ParseAssemblyString(ir_string.c_str(),jl_Module,Err,jl_LLVMContext);
 #endif
