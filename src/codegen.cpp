@@ -681,6 +681,13 @@ struct jl_gcinfo_t {
     BasicBlock::iterator last_gcframe_inst;
 };
 
+// Keeps tracks of all functions and compile units created during this cycle
+// to be able to atomically add them to a module.
+typedef struct {
+    std::vector<Function *> functions;
+    std::vector<DICompileUnit *> CUs;
+} jl_cyclectx_t;
+
 // information about the context of a piece of code: its enclosing
 // function and module, and visible local variables and labels.
 typedef struct {
@@ -712,6 +719,8 @@ typedef struct {
     llvm::DIBuilder *dbuilder;
     bool debug_enabled;
     std::vector<CallInst*> to_inline;
+
+    jl_cyclectx_t *cyclectx;
 } jl_codectx_t;
 
 typedef struct {
@@ -942,10 +951,10 @@ void jl_dump_compiles(void *s)
 
 // --- entry point ---
 //static int n_emit=0;
-static Function *emit_function(jl_lambda_info_t *lam);
+static Function *emit_function(jl_lambda_info_t *lam, jl_cyclectx_t *cyclectx);
 static void jl_finalize_module(Module *m);
 //static int n_compile=0;
-static Function *to_function(jl_lambda_info_t *li)
+static Function *to_function(jl_lambda_info_t *li, jl_cyclectx_t *cyclectx)
 {
     JL_LOCK(codegen);
     JL_SIGATOMIC_BEGIN();
@@ -959,7 +968,13 @@ static Function *to_function(jl_lambda_info_t *li)
     jl_gc_inhibit_finalizers(nested_compile);
     Function *f = NULL;
     JL_TRY {
-        f = emit_function(li);
+        jl_cyclectx_t *newcyclectx = cyclectx;
+        if (!newcyclectx)
+            newcyclectx = new jl_cyclectx_t;
+        f = emit_function(li, newcyclectx);
+        // If we're the root of the cycle, realize all functions
+        if (!cyclectx)
+            realize_cycle(newcyclectx);
         //n_emit++;
     }
     JL_CATCH {
@@ -1047,16 +1062,57 @@ static void jl_finalize_module(Module *m)
 #endif
 }
 
+static void writeRecoveryFile(llvm::Module *mod)
+{
+    std::error_code err;
+    mod->dump();
+    std::cout << "Julia emitted a broken LLVM module (about to be __jl_dump.bc)."
+              << "Please file a bug report.\n"
+              << "If the module writing below fails,"
+              << "please include the textual representation printed above this error.";
+    StringRef fname_ref = StringRef("__jl_dump.bc");
+    raw_fd_ostream OS(fname_ref, err, sys::fs::F_None);
+    WriteBitcodeToFile(mod,OS);
+    OS.flush();
+    abort();
+}
+
 static uint64_t getAddressForOrCompileFunction(llvm::Function *llvmf)
 {
+    #ifdef JL_DEBUG_BUILD
+    llvm::raw_fd_ostream out(1,false);
+    #endif
     uint64_t addr = jl_mcjmm->getSymbolAddress(llvmf->getName());
     if (addr)
         return addr;
+    if (llvmf->getParent() != active_module)
+        return jl_ExecutionEngine->getFunctionAddress(llvmf->getName());
     if (!imaging_mode) {
         realize_pending_globals();
         jl_finalize_module(active_module);
-        for (auto &F : active_module->functions())
+        #ifdef JL_DEBUG_BUILD
+        Module *backup = llvm::CloneModule(active_module);
+        if(verifyModule(*active_module))
+            writeRecoveryFile(backup);
+        #endif
+        for (auto &F : active_module->functions()) {
+            if (F.isDeclaration())
+                continue;
+            #ifdef JL_DEBUG_BUILD
+            if(verifyFunction(F))
+                writeRecoveryFile(backup);
+            #endif
             FPM->run(F);
+            #ifdef JL_DEBUG_BUILD
+            if(verifyFunction(F))
+                writeRecoveryFile(backup);
+            #endif
+        }
+        #ifdef JL_DEBUG_BUILD
+        if(verifyModule(*active_module))
+            writeRecoveryFile(backup);
+        delete backup;
+        #endif
     }
     addr = jl_ExecutionEngine->getFunctionAddress(llvmf->getName());
     if (!imaging_mode) {
@@ -1140,12 +1196,12 @@ extern "C" void jl_generate_fptr(jl_function_t *f)
     JL_UNLOCK(codegen);
 }
 
-extern "C" void jl_compile_linfo(jl_lambda_info_t *li)
+extern "C" void jl_compile_linfo(jl_lambda_info_t *li, void *cyclectx)
 {
     if (li->functionObject == NULL) {
         // objective: assign li->functionObject
         li->inCompile = 1;
-        (void)to_function(li);
+        (void)to_function(li, (jl_cyclectx_t *)cyclectx);
         li->inCompile = 0;
     }
 }
@@ -1201,7 +1257,7 @@ static Function *jl_cfunction_object(jl_function_t *f, jl_value_t *rt, jl_tuplet
         }
     }
 
-    jl_function_t *ff = jl_get_specialization(f, (jl_tupletype_t*)sigt);
+    jl_function_t *ff = jl_get_specialization(f, (jl_tupletype_t*)sigt, NULL);
     if (ff != NULL && ff->env==(jl_value_t*)jl_emptysvec && ff->linfo != NULL) {
         jl_lambda_info_t *li = ff->linfo;
         if (!jl_types_equal((jl_value_t*)li->specTypes, sigt)) {
@@ -1314,7 +1370,7 @@ void *jl_get_llvmf(jl_function_t *f, jl_tupletype_t *tt, bool getwrapper)
     JL_GC_PUSH1(&linfo);
     if (jl_is_gf(f)) {
         if (tt != NULL) {
-            jl_function_t *sf = jl_get_specialization(f, tt);
+            jl_function_t *sf = jl_get_specialization(f, tt, NULL);
             linfo = (sf == NULL ? NULL : sf->linfo);
             if (linfo == NULL) {
                 sf = jl_method_lookup_by_type(jl_gf_mtable(f), tt, 0, 0);
@@ -1367,7 +1423,7 @@ void *jl_get_llvmf(jl_function_t *f, jl_tupletype_t *tt, bool getwrapper)
         }
     }
     if (linfo->functionObject == NULL && linfo->specFunctionObject == NULL) {
-        jl_compile_linfo(linfo);
+        jl_compile_linfo(linfo, NULL);
     }
     JL_GC_POP();
     if (!getwrapper && linfo->specFunctionObject != NULL)
@@ -2420,7 +2476,7 @@ static bool emit_known_call(jl_cgval_t *ret, jl_value_t *ff,
                       jl_sprint((jl_value_t*)aty));
                   }
                 */
-                f = jl_get_specialization(f, (jl_tupletype_t*)rt1);
+                f = jl_get_specialization(f, (jl_tupletype_t*)rt1, (void*)ctx->cyclectx);
                 if (f != NULL) {
                     assert(f->linfo->functionObject != NULL);
                     *theFptr = (Value*)f->linfo->functionObject;
@@ -2989,10 +3045,8 @@ static jl_cgval_t emit_call_function_object(jl_function_t *f, Value *theF, Value
         (void)julia_type_to_llvm(jlretty, &retboxed);
         Function *cf = (Function*)f->linfo->specFunctionObject;
         if (!cf->getParent() || (cf->getParent() == builtins_module &&
-            builtins_module != active_module)) { // Call cycle. It must be safe to add this to the current module
-            if (cf->getParent())
-                cf->removeFromParent();
-            active_module->getFunctionList().push_back(cf);
+            builtins_module != active_module)) { // Call cycle
+            prepare_call(cf);
         }
         FunctionType *cft = cf->getFunctionType();
         size_t nfargs = cft->getNumParams();
@@ -3570,7 +3624,6 @@ static jl_cgval_t emit_expr(jl_value_t *expr, jl_codectx_t *ctx, bool isboxed, b
         if (builder.GetInsertBlock()->getTerminator() == NULL) {
             builder.CreateBr(bb); // all BasicBlocks must exit explicitly
         }
-        ctx->f->getBasicBlockList().push_back(bb);
         builder.SetInsertPoint(bb);
         return jl_cgval_t();
     }
@@ -4079,7 +4132,7 @@ static Function *gen_cfun_wrapper(jl_function_t *ff, jl_value_t *jlrettype, jl_t
     if (fargt.size() + sret != fargt_sig.size())
         jl_error("va_arg syntax not allowed for cfunction argument list");
 
-    jl_compile_linfo(lam);
+    jl_compile_linfo(lam, NULL);
     if (!lam->functionObject) {
         jl_errorf("error compiling %s while creating cfunction",
                   jl_symbol_name(lam->name));
@@ -4379,7 +4432,7 @@ static Function *gen_jlcall_wrapper(jl_lambda_info_t *lam, jl_expr_t *ast, Funct
 }
 
 // Compile to LLVM IR, using a specialized signature if applicable.
-static Function *emit_function(jl_lambda_info_t *lam)
+static Function *emit_function(jl_lambda_info_t *lam, jl_cyclectx_t *cyclectx)
 {
     // step 1. unpack AST and allocate codegen context for this function
     jl_expr_t *ast = (jl_expr_t*)lam->ast;
@@ -4407,6 +4460,7 @@ static Function *emit_function(jl_lambda_info_t *lam)
     ctx.vaName = NULL;
     ctx.vaStack = false;
     ctx.boundsCheck.push_back(true);
+    ctx.cyclectx = cyclectx;
 
     // step 2. process var-info lists to see what vars are captured, need boxing
     jl_value_t *gensym_types = jl_lam_gensyms(ast);
@@ -5170,7 +5224,7 @@ static Function *emit_function(jl_lambda_info_t *lam)
                 labels[lname] = prev;
             }
             else {
-                prev = BasicBlock::Create(getGlobalContext(), "L");
+                prev = BasicBlock::Create(getGlobalContext(), "L", f);
                 labels[lname] = prev;
             }
         }
@@ -5329,26 +5383,21 @@ static Function *emit_function(jl_lambda_info_t *lam)
     for(std::vector<CallInst*>::iterator it = ctx.to_inline.begin(); it != ctx.to_inline.end(); ++it) {
         Function *inlinef = (*it)->getCalledFunction();
         InlineFunctionInfo info;
+        // Intrinsics that InlineFunction might create
+        prepare_call(Intrinsic::getDeclaration(builtins_module, Intrinsic::lifetime_start));
+        prepare_call(Intrinsic::getDeclaration(builtins_module, Intrinsic::lifetime_end));
         if (!InlineFunction(*it,info))
             jl_error("Inlining Pass failed");
         inlinef->eraseFromParent();
     }
 
-    // These need to be resolved together
-    if (!f->getParent() || f->getParent() != active_module) {
-        if (f->getParent())
-            f->removeFromParent();
-        active_module->getFunctionList().push_back(f);
-    }
-    if (fwrap) {
-        fwrap->removeFromParent();
-        active_module->getFunctionList().push_back(fwrap);
-    }
+    cyclectx->functions.push_back(f);
+    if (fwrap)
+        cyclectx->functions.push_back(fwrap);
 
     // step 18. Perform any delayed instantiations
     if (ctx.debug_enabled) {
-        NamedMDNode *NMD = active_module->getOrInsertNamedMetadata("llvm.dbg.cu");
-        NMD->addOperand(CU);
+        cyclectx->CUs.push_back(CU);
         ctx.dbuilder->finalize();
     }
 

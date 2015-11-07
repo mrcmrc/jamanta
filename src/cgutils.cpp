@@ -102,13 +102,26 @@ static GlobalValue *realize_pending_global(Instruction *User, GlobalValue *G, st
                 //std::cout << "Skipping" << std::endl;
                 return nullptr;
             }
-            assert(F);
-            Function *NewF = M->getFunction(F->getName());
-            if (!NewF) {
-                NewF = Function::Create(F->getFunctionType(),
-                            Function::ExternalLinkage,
-                            F->getName(),
-                            M);
+            Function *NewF = nullptr;
+            if (!F->isDeclaration() && F->getParent() == builtins_module) {
+                // It's a definition. Actually move the function and create a
+                // declaration in the original module
+                NewF = F;
+                F->removeFromParent();
+                M->getFunctionList().push_back(F);
+                Function::Create(F->getFunctionType(),
+                    Function::ExternalLinkage,
+                    F->getName(),
+                    active_module);
+            } else {
+                assert(F);
+                NewF = M->getFunction(F->getName());
+                if (!NewF) {
+                    NewF = Function::Create(F->getFunctionType(),
+                                Function::ExternalLinkage,
+                                F->getName(),
+                                M);
+                }
             }
             FixedGlobals[M] = NewF;
         }
@@ -153,6 +166,19 @@ static void realize_pending_globals()
                 continue;
             Use1.set(Replacement);
         }
+    }
+}
+
+static void realize_cycle(jl_cyclectx_t *cyclectx)
+{
+    // These need to be resolved together
+    for (auto *F : cyclectx->functions) {
+        F->removeFromParent();
+        active_module->getFunctionList().push_back(F);
+    }
+    for (auto *CU : cyclectx->CUs) {
+        NamedMDNode *NMD = active_module->getOrInsertNamedMetadata("llvm.dbg.cu");
+        NMD->addOperand(CU);
     }
 }
 
