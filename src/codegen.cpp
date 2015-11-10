@@ -973,8 +973,10 @@ static Function *to_function(jl_lambda_info_t *li, jl_cyclectx_t *cyclectx)
             newcyclectx = new jl_cyclectx_t;
         f = emit_function(li, newcyclectx);
         // If we're the root of the cycle, realize all functions
-        if (!cyclectx)
+        if (!cyclectx) {
             realize_cycle(newcyclectx);
+            delete newcyclectx;
+        }
         //n_emit++;
     }
     JL_CATCH {
