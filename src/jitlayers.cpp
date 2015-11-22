@@ -82,7 +82,9 @@ public:
                           },
                           [](const std::string &S) { return nullptr; }
                         );
-        return CompileLayer->addModuleSet(singletonSet(std::move(M)),
+        SmallVector<std::unique_ptr<Module>,1> Ms;
+        Ms.push_back(std::unique_ptr<Module>{M});
+        return CompileLayer->addModuleSet(std::move(Ms),
                                          &MemMgr,
                                          std::move(Resolver));
     }

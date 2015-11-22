@@ -948,11 +948,13 @@ static uint64_t getAddressForOrCompileFunction(llvm::Function *llvmf)
     uint64_t addr = jl_mcjmm->getSymbolAddress(llvmf->getName());
     if (addr)
         return addr;
-    if (llvmf->getParent() != active_module)
+    Function *ActiveF = active_module->getFunction(llvmf->getName());
+    // Must have been in a prior module. Safe to ask the execution engine
+    // to emit it.
+    if (!ActiveF || ActiveF->isDeclaration())
         return jl_ExecutionEngine->getFunctionAddress(llvmf->getName());
     if (!imaging_mode) {
         realize_pending_globals();
-        jl_finalize_module(active_module);
         #ifdef JL_DEBUG_BUILD
         Module *backup = llvm::CloneModule(active_module);
         if(verifyModule(*active_module))
@@ -976,8 +978,10 @@ static uint64_t getAddressForOrCompileFunction(llvm::Function *llvmf)
             writeRecoveryFile(backup);
         delete backup;
         #endif
+        jl_finalize_module(active_module);
     }
     addr = jl_ExecutionEngine->getFunctionAddress(llvmf->getName());
+    assert(addr != 0);
     if (!imaging_mode) {
         active_module = new Module("julia", jl_LLVMContext);
         jl_setup_module(active_module);
@@ -999,9 +1003,9 @@ extern "C" void jl_generate_fptr(jl_function_t *f)
             Module *m = new Module("julia", jl_LLVMContext);
             jl_setup_module(m);
             FunctionMover mover(m, shadow_module);
-            li->functionObject = mover.CloneFunction((Function*)li->functionObject);
+            mover.CloneFunction((Function*)li->functionObject);
             if (li->specFunctionObject != NULL)
-                li->specFunctionObject = mover.CloneFunction((Function*)li->specFunctionObject);
+                mover.CloneFunction((Function*)li->specFunctionObject);
             if (li->cFunctionList != NULL) {
                 size_t i;
                 cFunctionList_t *list = (cFunctionList_t*)li->cFunctionList;
@@ -1010,19 +1014,18 @@ extern "C" void jl_generate_fptr(jl_function_t *f)
                 }
             }
             jl_finalize_module(m);
+            li->fptr = (jl_fptr_t)jl_ExecutionEngine->getFunctionAddress(((Function*)li->functionObject)->getName());
+        } else {
+            li->fptr = (jl_fptr_t)getAddressForOrCompileFunction((Function*)li->functionObject);
         }
+        #else
+        li->fptr = (jl_fptr_t)jl_ExecutionEngine->getPointerToFunction((Function*)li->functionObject);
         #endif
 
-        Function *llvmf = (Function*)li->functionObject;
-#ifdef USE_MCJIT
-        li->fptr = (jl_fptr_t)getAddressForOrCompileFunction(llvmf);
-#else
-        li->fptr = (jl_fptr_t)jl_ExecutionEngine->getPointerToFunction(llvmf);
-#endif
         assert(li->fptr != NULL);
 #ifndef KEEP_BODIES
         if (!imaging_mode)
-            llvmf->deleteBody();
+            ((Function*)li->functionObject)->deleteBody();
 #endif
 
         if (li->cFunctionList != NULL) {
@@ -1044,7 +1047,10 @@ extern "C" void jl_generate_fptr(jl_function_t *f)
 
         if (li->specFunctionObject != NULL) {
 #ifdef USE_MCJIT
-            (void)getAddressForOrCompileFunction((Function*)li->specFunctionObject);
+            if (imaging_mode)
+              (void)jl_ExecutionEngine->getFunctionAddress(((Function*)li->specFunctionObject)->getName());
+            else
+              (void)getAddressForOrCompileFunction((Function*)li->specFunctionObject);
 #else
             (void)jl_ExecutionEngine->getPointerToFunction((Function*)li->specFunctionObject);
 #endif
@@ -3176,9 +3182,9 @@ static Value *global_binding_pointer(jl_module_t *m, jl_sym_t *s,
             // var not found. switch to delayed lookup.
             Constant *initnul = ConstantPointerNull::get((PointerType*)T_pjlvalue);
             GlobalVariable *bindinggv =
-                new GlobalVariable(imaging_mode ? *shadow_module : *active_module, T_pjlvalue,
+                prepare_global(new GlobalVariable(imaging_mode ? *shadow_module : *builtins_module, T_pjlvalue,
                                    false, GlobalVariable::PrivateLinkage,
-                                   initnul, "delayedvar");
+                                   initnul, "delayedvar"));
             Value *cachedval = builder.CreateLoad(bindinggv);
             BasicBlock *have_val = BasicBlock::Create(jl_LLVMContext, "found"),
                 *not_found = BasicBlock::Create(jl_LLVMContext, "notfound");
@@ -4020,6 +4026,8 @@ static Function *gen_cfun_wrapper(jl_function_t *ff, jl_value_t *jlrettype, jl_t
 #ifdef LLVM37
     cw->addFnAttr("no-frame-pointer-elim", "true");
 #endif
+    Function *cw_proto = function_proto(cw);
+
     BasicBlock *b0 = BasicBlock::Create(jl_LLVMContext, "top", cw);
     builder.SetInsertPoint(b0);
     DebugLoc noDbg;
@@ -4038,7 +4046,7 @@ static Function *gen_cfun_wrapper(jl_function_t *ff, jl_value_t *jlrettype, jl_t
         jl_throw(jl_memory_exception);
     list2->len = len;
     list2->data()[len-1].isref = isref;
-    list2->data()[len-1].f = cw;
+    list2->data()[len-1].f = cw_proto;
     lam->cFunctionList = list2;
 
     // See whether this function is specsig or jlcall
@@ -4214,7 +4222,7 @@ static Function *gen_cfun_wrapper(jl_function_t *ff, jl_value_t *jlrettype, jl_t
     jl_gc_inhibit_finalizers(nested_compile);
     JL_SIGATOMIC_END();
 
-    return cw;
+    return cw_proto;
 }
 
 // generate a julia-callable function that calls f (AKA lam)
@@ -4481,12 +4489,12 @@ static Function *emit_function(jl_lambda_info_t *lam, jl_cyclectx_t *cyclectx)
         f->addFnAttr("no-frame-pointer-elim", "true");
 #endif
         if (lam->specFunctionObject == NULL) {
-            lam->specFunctionObject = (void*)f;
+            lam->specFunctionObject = (void*)imaging_mode ? f : function_proto(f);
             lam->specFunctionID = jl_assign_functionID(f);
         }
         if (lam->functionObject == NULL) {
             fwrap = gen_jlcall_wrapper(lam, ast, f, ctx.sret);
-            lam->functionObject = (void*)fwrap;
+            lam->functionObject = (void*)imaging_mode ? fwrap : function_proto(fwrap);
             lam->functionID = jl_assign_functionID(fwrap);
         }
     }
@@ -4498,7 +4506,7 @@ static Function *emit_function(jl_lambda_info_t *lam, jl_cyclectx_t *cyclectx)
         f->addFnAttr("no-frame-pointer-elim", "true");
 #endif
         if (lam->functionObject == NULL) {
-            lam->functionObject = (void*)f;
+            lam->functionObject = (void*)imaging_mode ? f : function_proto(f);
             lam->functionID = jl_assign_functionID(f);
         }
     }

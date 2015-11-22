@@ -93,15 +93,20 @@ static GlobalValue *realize_pending_global(Instruction *User, GlobalValue *G, st
                 NewGV = new GlobalVariable(*M, GV->getType()->getElementType(),
                                         GV->isConstant(), GlobalVariable::ExternalLinkage,
                                         NULL, GV->getName(), NULL, GV->getThreadLocalMode());
+                // Move over initializer
+                if (GV->hasInitializer()) {
+                    NewGV->setInitializer(GV->getInitializer());
+                    GV->setInitializer(nullptr);
+                }
             }
             FixedGlobals[M] = NewGV;
         } else {
             Function *F = dyn_cast<Function>(G);
             //std::cout << "Realizing " << std::string(F->getName()) << std::endl;
-            if (!F->getParent()) {
+            //if (!F->getParent()) {
                 //std::cout << "Skipping" << std::endl;
-                return nullptr;
-            }
+            //    return nullptr;
+            //}
             Function *NewF = nullptr;
             if (!F->isDeclaration() && F->getParent() == builtins_module) {
                 // It's a definition. Actually move the function and create a
@@ -144,10 +149,9 @@ static void realize_pending_globals()
             ++UI;
             Instruction *User = dyn_cast<Instruction>(Use1.getUser());
             if (!User) {
-                // Handle bit casts
+                // Handle bit casts and getelementptrs
                 ConstantExpr *Expr = dyn_cast<ConstantExpr>(Use1.getUser());
                 assert(Expr);
-                assert(Expr->getNumOperands() == 1);
                 Value::use_iterator UI2 = Expr->use_begin(), E2 = Expr->use_end();
                 for (; UI2 != E2;) {
                     Use &Use2 = *UI2;
@@ -157,7 +161,7 @@ static void realize_pending_globals()
                     Replacement = realize_pending_global(User2,G,FixedGlobals);
                     if (!Replacement)
                         continue;
-                    Use2.set(Expr->getWithOperandReplaced(0,Replacement));
+                    Use2.set(Expr->getWithOperandReplaced(Use1.getOperandNo(),Replacement));
                 }
                 continue;
             }
@@ -236,6 +240,13 @@ extern "C" {
     extern int jl_in_inference;
 }
 
+static GlobalVariable *global_proto(GlobalVariable *G) {
+    GlobalVariable *proto = new GlobalVariable(G->getType()->getElementType(),
+            G->isConstant(), GlobalVariable::ExternalLinkage,
+            NULL, G->getName(), G->getThreadLocalMode());
+    return proto;
+}
+
 static GlobalVariable *stringConst(const std::string &txt)
 {
     GlobalVariable *gv = stringConstants[txt];
@@ -259,8 +270,11 @@ static GlobalVariable *stringConst(const std::string &txt)
                                                        txt.length()+1)),
                                 vname);
         gv->setUnnamedAddr(true);
+        gv = imaging_mode ? gv : prepare_global(global_proto(gv));
         stringConstants[txt] = gv;
         strno++;
+    } else {
+        prepare_global(gv);
     }
     return gv;
 
@@ -275,6 +289,41 @@ JL_DLLEXPORT std::map<Value *, void*> jl_llvm_to_jl_value;
 // In imaging mode, cache a fast mapping of Function * to code address
 // because this is queried in the hot path
 static std::map<Function *, uint64_t> emitted_function_symtab;
+
+static Function *function_proto(Function *F) {
+    Function *NewF = Function::Create(F->getFunctionType(),
+                            Function::ExternalLinkage,
+                            F->getName());
+    NewF->setAttributes(AttributeSet());
+
+    // FunctionType does not include any attributes. Copy them over manually
+    // as codegen may make decisions based on the presence of certain attributes
+    NewF->copyAttributesFrom(F);
+
+    // Declarations are not allowed to have personality routines, but
+    // copyAttributesFrom sets them anyway, so clear them again manually
+    NewF->setPersonalityFn(nullptr);
+
+    AttributeSet OldAttrs = F->getAttributes();
+    // Clone any argument attributes that are present in the VMap.
+    auto ArgI = NewF->arg_begin();
+    for (const Argument &OldArg : F->args()) {
+        AttributeSet attrs =
+            OldAttrs.getParamAttributes(OldArg.getArgNo() + 1);
+        if (attrs.getNumSlots() > 0)
+            ArgI->addAttr(attrs);
+        ++ArgI;
+    }
+
+    NewF->setAttributes(
+      NewF->getAttributes()
+          .addAttributes(NewF->getContext(), AttributeSet::ReturnIndex,
+                         OldAttrs.getRetAttributes())
+          .addAttributes(NewF->getContext(), AttributeSet::FunctionIndex,
+                         OldAttrs.getFnAttributes()));
+
+    return NewF;
+}
 
 #ifdef USE_MCJIT
 class FunctionMover : public ValueMaterializer
@@ -344,40 +393,10 @@ public:
 	//return destModule->getOrInsertFunction(F->getName(), F->getFunctionType());
         Function *NewF = destModule->getFunction(F->getName());
         if (!NewF) {
-            NewF = Function::Create(F->getFunctionType(),
-                                          Function::ExternalLinkage,
-                                          F->getName(),destModule);
-            NewF->setAttributes(AttributeSet());
-
-            // FunctionType does not include any attributes. Copy them over manually
-            // as codegen may make decisions based on the presence of certain attributes
-            NewF->copyAttributesFrom(F);
-
-            #ifdef LLVM37
-            // Declarations are not allowed to have personality routines, but
-            // copyAttributesFrom sets them anyway, so clear them again manually
-            NewF->setPersonalityFn(nullptr);
-            #endif
-
-            AttributeSet OldAttrs = F->getAttributes();
-            // Clone any argument attributes that are present in the VMap.
-            auto ArgI = NewF->arg_begin();
-            for (const Argument &OldArg : F->args()) {
-                AttributeSet attrs =
-                    OldAttrs.getParamAttributes(OldArg.getArgNo() + 1);
-                if (attrs.getNumSlots() > 0)
-                    ArgI->addAttr(attrs);
-                ++ArgI;
-            }
-
-            NewF->setAttributes(
-              NewF->getAttributes()
-                  .addAttributes(NewF->getContext(), AttributeSet::ReturnIndex,
-                                 OldAttrs.getRetAttributes())
-                  .addAttributes(NewF->getContext(), AttributeSet::FunctionIndex,
-                                 OldAttrs.getFnAttributes()));
+            NewF = function_proto(F);
+            destModule->getFunctionList().push_back(NewF);
         }
-	return NewF;
+	    return NewF;
     }
 
     virtual Value *materializeValueFor (Value *V)

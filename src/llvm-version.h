@@ -10,7 +10,7 @@
 #define LLVM37 1
 // Experimental:
 //#define USE_ORCMCJIT
-//#define USE_ORCJIT
+#define USE_ORCJIT
 #endif
 
 #if defined(LLVM_VERSION_MAJOR) && LLVM_VERSION_MAJOR == 3 && LLVM_VERSION_MINOR >= 6
