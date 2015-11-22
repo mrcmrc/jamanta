@@ -1,15 +1,136 @@
+// This file is part of Julia.
+// Parts of this file are copied from LLVM, under the UIUC license.
+
 #ifdef USE_ORCJIT
 
-template <typename T>
-static std::vector<T> singletonSet(T t) {
-  std::vector<T> Vec;
-  Vec.push_back(std::move(t));
-  return Vec;
+namespace {
+
+using namespace llvm;
+using namespace llvm::object;
+using namespace llvm::orc;
+
+// ------------------------ TEMPORARILY COPIED FROM LLVM -----------------
+// This must be kept in sync with gdb/gdb/jit.h .
+extern "C" {
+
+  typedef enum {
+    JIT_NOACTION = 0,
+    JIT_REGISTER_FN,
+    JIT_UNREGISTER_FN
+  } jit_actions_t;
+
+  struct jit_code_entry {
+    struct jit_code_entry *next_entry;
+    struct jit_code_entry *prev_entry;
+    const char *symfile_addr;
+    uint64_t symfile_size;
+  };
+
+  struct jit_descriptor {
+    uint32_t version;
+    // This should be jit_actions_t, but we want to be specific about the
+    // bit-width.
+    uint32_t action_flag;
+    struct jit_code_entry *relevant_entry;
+    struct jit_code_entry *first_entry;
+  };
+
+  // We put information about the JITed function in this global, which the
+  // debugger reads.  Make sure to specify the version statically, because the
+  // debugger checks the version before we can set it during runtime.
+  struct jit_descriptor __jit_debug_descriptor = { 1, 0, nullptr, nullptr };
+
+  // LLVM implements this. Put only one to av
+  extern void __jit_debug_register_code();
+
 }
+
+/// Do the registration.
+void NotifyDebugger(jit_code_entry* JITCodeEntry) {
+  __jit_debug_descriptor.action_flag = JIT_REGISTER_FN;
+
+  // Insert this entry at the head of the list.
+  JITCodeEntry->prev_entry = nullptr;
+  jit_code_entry* NextEntry = __jit_debug_descriptor.first_entry;
+  JITCodeEntry->next_entry = NextEntry;
+  if (NextEntry) {
+    NextEntry->prev_entry = JITCodeEntry;
+  }
+  __jit_debug_descriptor.first_entry = JITCodeEntry;
+  __jit_debug_descriptor.relevant_entry = JITCodeEntry;
+  __jit_debug_register_code();
+}
+
+// --------------------------------------------------------------------------
+
+class DebugObjectRegistrar {
+private:
+    void NotifyGDB(OwningBinary<ObjectFile> &DebugObj) {
+      const char *Buffer = DebugObj.getBinary()->getMemoryBufferRef().getBufferStart();
+      size_t      Size = DebugObj.getBinary()->getMemoryBufferRef().getBufferSize();
+
+      assert(Buffer && "Attempt to register a null object with a debugger.");
+      jit_code_entry* JITCodeEntry = new jit_code_entry();
+
+      if (!JITCodeEntry) {
+        llvm::report_fatal_error(
+          "Allocation failed when registering a JIT entry!\n");
+      } else {
+        JITCodeEntry->symfile_addr = Buffer;
+        JITCodeEntry->symfile_size = Size;
+
+        NotifyDebugger(JITCodeEntry);
+      }
+    }
+
+    std::vector<OwningBinary<ObjectFile>> SavedObjects;
+    std::unique_ptr<JITEventListener> JuliaListener;
+
+public:
+    DebugObjectRegistrar() : JuliaListener(CreateJuliaJITEventListener()) {}
+
+    template <typename ObjSetT, typename LoadResult>
+    void operator()(ObjectLinkingLayerBase::ObjSetHandleT, const ObjSetT &Objects,
+                  const LoadResult &LOS) {
+        auto oit = Objects.begin();
+        auto lit = LOS.begin();
+        while (oit != Objects.end()) {
+            auto &Object = *oit;
+            auto &LO = *lit;
+
+            OwningBinary<ObjectFile> SavedObject = LO->getObjectForDebug(*Object);
+
+            // If the debug object is unavailable, save (a copy of) the original object
+            // for our backtraces
+            if (!SavedObject.getBinary()) {
+                // This is unfortunate, but there doesn't seem to be a way to take
+                // ownership of the original buffer
+                auto NewBuffer = MemoryBuffer::getMemBuffer(Object->getMemoryBufferRef(),false);
+                auto NewObj = ObjectFile::createObjectFile(NewBuffer->getMemBufferRef());
+                SavedObject = OwningBinary<ObjectFile>(std::move(*NewObj),std::move(NewBuffer));
+            }
+            else
+                NotifyGDB(SavedObject);
+
+            SavedObjects.push_back(std::move(SavedObject));
+            JuliaListener->NotifyObjectEmitted(*SavedObjects.back().getBinary(),*LO);
+
+            ++oit;
+            ++lit;
+        }
+    }
+};
+
+}
+
+#if defined(_OS_DARWIN_) && defined(LLVM37) && defined(LLVM_SHLIB)
+#define CUSTOM_MEMORY_MANAGER 1
+extern RTDyldMemoryManager* createRTDyldMemoryManagerOSX();
+#endif
 
 class JuliaOJIT {
 public:
-    typedef orc::ObjectLinkingLayer<> ObjLayerT;
+    typedef orc::ObjectLinkingLayer<DebugObjectRegistrar> ObjLayerT;
     typedef orc::IRCompileLayer<ObjLayerT> CompileLayerT;
     typedef CompileLayerT::ModuleSetHandleT ModuleHandleT;
     typedef StringMap<void*> GlobalSymbolTableT;
@@ -18,7 +139,14 @@ public:
     JuliaOJIT(TargetMachine &TM)
       : TM(TM),
         DL(TM.createDataLayout()),
-        ObjStream(ObjBufferSV) {
+        ObjStream(ObjBufferSV),
+        MemMgr(
+#ifdef CUSTOM_MEMORY_MANAGER
+            createRTDyldMemoryManagerOSX()
+#else
+            new SectionMemoryManager
+#endif
+            ) {
             if (TM.addPassesToEmitMC(PM, Ctx, ObjStream))
                 llvm_unreachable("Target does not support MC emission.");
 
@@ -85,7 +213,7 @@ public:
         SmallVector<std::unique_ptr<Module>,1> Ms;
         Ms.push_back(std::unique_ptr<Module>{M});
         return CompileLayer->addModuleSet(std::move(Ms),
-                                         &MemMgr,
+                                         MemMgr,
                                          std::move(Resolver));
     }
 
@@ -130,7 +258,7 @@ private:
     raw_svector_ostream ObjStream;
     legacy::PassManager PM;
     MCContext *Ctx;
-    SectionMemoryManager MemMgr;
+    RTDyldMemoryManager *MemMgr;
     ObjLayerT ObjectLayer;
     std::unique_ptr<CompileLayerT> CompileLayer;
     GlobalSymbolTableT GlobalSymbolTable;
