@@ -597,7 +597,7 @@ static jl_cgval_t emit_llvmcall(jl_value_t **args, size_t nargs, jl_codectx_t *c
             std::stringstream name;
             name << (ctx->f->getName().str()) << "u" << i++;
             ir_name = name.str();
-            if (active_module->getFunction(ir_name) == NULL)
+            if (builtins_module->getFunction(ir_name) == NULL)
                 break;
         }
 
@@ -646,9 +646,9 @@ static jl_cgval_t emit_llvmcall(jl_value_t **args, size_t nargs, jl_codectx_t *c
         std::string ir_string = ir_stream.str();
 #ifdef LLVM36
         Module *m = NULL;
-        bool failed = parseAssemblyInto(llvm::MemoryBufferRef(ir_string,"llvmcall"),*active_module,Err);
+        bool failed = parseAssemblyInto(llvm::MemoryBufferRef(ir_string,"llvmcall"),*builtins_module,Err);
         if (!failed)
-            m = active_module;
+            m = builtins_module;
 #else
         Module *m = ParseAssemblyString(ir_string.c_str(),jl_Module,Err,jl_LLVMContext);
 #endif
@@ -700,7 +700,6 @@ static jl_cgval_t emit_llvmcall(jl_value_t **args, size_t nargs, jl_codectx_t *c
     f->setLinkage(GlobalValue::LinkOnceODRLinkage);
 
     // the actual call
-    assert(f->getParent() == active_module); // no prepare_call(f) is needed below, since this was just emitted into the same module
     CallInst *inst = builder.CreateCall(f, ArrayRef<Value*>(&argvals[0], nargt));
     ctx->to_inline.push_back(inst);
 
