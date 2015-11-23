@@ -3,12 +3,6 @@
 
 #ifdef USE_ORCJIT
 
-namespace {
-
-using namespace llvm;
-using namespace llvm::object;
-using namespace llvm::orc;
-
 // ------------------------ TEMPORARILY COPIED FROM LLVM -----------------
 // This must be kept in sync with gdb/gdb/jit.h .
 extern "C" {
@@ -38,12 +32,16 @@ extern "C" {
   // We put information about the JITed function in this global, which the
   // debugger reads.  Make sure to specify the version statically, because the
   // debugger checks the version before we can set it during runtime.
-  struct jit_descriptor __jit_debug_descriptor = { 1, 0, nullptr, nullptr };
+  extern struct jit_descriptor __jit_debug_descriptor;
 
-  // LLVM implements this. Put only one to av
-  extern void __jit_debug_register_code();
-
+  LLVM_ATTRIBUTE_NOINLINE extern void __jit_debug_register_code();
 }
+
+namespace {
+
+using namespace llvm;
+using namespace llvm::object;
+using namespace llvm::orc;
 
 /// Do the registration.
 void NotifyDebugger(jit_code_entry* JITCodeEntry) {
@@ -105,7 +103,7 @@ public:
             if (!SavedObject.getBinary()) {
                 // This is unfortunate, but there doesn't seem to be a way to take
                 // ownership of the original buffer
-                auto NewBuffer = MemoryBuffer::getMemBuffer(Object->getMemoryBufferRef(),false);
+                auto NewBuffer = MemoryBuffer::getMemBufferCopy(Object->getData(), Object->getFileName());
                 auto NewObj = ObjectFile::createObjectFile(NewBuffer->getMemBufferRef());
                 SavedObject = OwningBinary<ObjectFile>(std::move(*NewObj),std::move(NewBuffer));
             }

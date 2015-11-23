@@ -1855,6 +1855,11 @@ static void show_call(jl_value_t *F, jl_value_t **args, uint32_t nargs)
 }
 #endif
 
+static jl_value_t *verify_type(jl_value_t *v)
+{
+assert(jl_typeof(jl_typeof(v)));
+return v;
+}
 
 JL_CALLABLE(jl_apply_generic)
 {
@@ -1895,10 +1900,10 @@ JL_CALLABLE(jl_apply_generic)
                     li->unspecialized->env = NULL;
                 jl_gc_wb(li, li->unspecialized);
             }
-            return jl_apply_unspecialized(mfunc, args, nargs);
+            return verify_type(jl_apply_unspecialized(mfunc, args, nargs));
         }
         assert(!mfunc->linfo || !mfunc->linfo->inInference);
-        return jl_apply(mfunc, args, nargs);
+        return verify_type(jl_apply(mfunc, args, nargs));
     }
 
     // cache miss case
@@ -1924,7 +1929,7 @@ JL_CALLABLE(jl_apply_generic)
     assert(!mfunc->linfo || !mfunc->linfo->inInference);
     jl_value_t *res = jl_apply(mfunc, args, nargs);
     JL_GC_POP();
-    return res;
+    return verify_type(res);
 }
 
 JL_DLLEXPORT jl_value_t *jl_gf_invoke_lookup(jl_function_t *gf,

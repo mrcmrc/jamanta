@@ -856,6 +856,8 @@ static Function *to_function(jl_lambda_info_t *li, jl_cyclectx_t *cyclectx)
         jl_rethrow_with_add("error compiling %s", jl_symbol_name(li->name));
     }
     assert(f != NULL);
+    if (imaging_mode)
+        FPM->run(*f);
     //n_compile++;
     // print out the function's LLVM code
     // jl_static_show(JL_STDERR, (jl_value_t*)li);
@@ -4047,7 +4049,7 @@ static Function *gen_cfun_wrapper(jl_function_t *ff, jl_value_t *jlrettype, jl_t
         jl_throw(jl_memory_exception);
     list2->len = len;
     list2->data()[len-1].isref = isref;
-    list2->data()[len-1].f = cw_proto;
+    list2->data()[len-1].f = imaging_mode ? cw : cw_proto;
     lam->cFunctionList = list2;
 
     // See whether this function is specsig or jlcall
@@ -4210,6 +4212,9 @@ static Function *gen_cfun_wrapper(jl_function_t *ff, jl_value_t *jlrettype, jl_t
     else
         builder.CreateRet(r);
     finalize_gc_frame(&ctx);
+
+    if (imaging_mode)
+        FPM->run(*cw);
 
     cw->removeFromParent();
     active_module->getFunctionList().push_back(cw);
@@ -6280,12 +6285,16 @@ extern "C" void jl_init_codegen(void)
         .setMCJITMemoryManager(std::move(std::unique_ptr<RTDyldMemoryManager>{new SectionMemoryManager()}))
 #endif
         .setTargetOptions(options)
-#if defined(_OS_LINUX_) && defined(_CPU_X86_64_)
+#if (defined(_OS_LINUX_) && defined(_CPU_X86_64_)) || defined(CODEGEN_TLS)
         .setRelocationModel(Reloc::PIC_)
 #else
         .setRelocationModel(Reloc::Default)
 #endif
+#ifdef CODEGEN_TLS
+        .setCodeModel(CodeModel::Small)
+#else
         .setCodeModel(CodeModel::JITDefault)
+#endif
 #ifdef DISABLE_OPT
         .setOptLevel(CodeGenOpt::None)
 #else
