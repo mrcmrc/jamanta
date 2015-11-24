@@ -1,6 +1,120 @@
 // This file is part of Julia.
 // Parts of this file are copied from LLVM, under the UIUC license.
 
+template <class T>
+static void addOptimizationPasses(T *PM)
+{
+#ifdef __has_feature
+#   if __has_feature(address_sanitizer)
+#   if defined(LLVM37) && !defined(LLVM38)
+    // LLVM 3.7 BUG: ASAN pass doesn't properly initialize its dependencies
+    initializeTargetLibraryInfoWrapperPassPass(*PassRegistry::getPassRegistry());
+#   endif
+    FPM->add(createAddressSanitizerFunctionPass());
+#   endif
+#   if __has_feature(memory_sanitizer)
+    FPM->add(llvm::createMemorySanitizerPass(true));
+#   endif
+#endif
+#ifdef LLVM37
+    PM->add(createTargetTransformInfoWrapperPass(jl_TargetMachine->getTargetIRAnalysis()));
+#else
+    jl_TargetMachine->addAnalysisPasses(*PM);
+#endif
+#ifdef LLVM38
+    PM->add(createTypeBasedAAWrapperPass());
+#else
+    PM->add(createTypeBasedAliasAnalysisPass());
+#endif
+    if (jl_options.opt_level>=1) {
+#ifdef LLVM38
+        PM->add(createBasicAAWrapperPass());
+#else
+        PM->add(createBasicAliasAnalysisPass());
+#endif
+    }
+    // list of passes from vmkit
+    PM->add(createCFGSimplificationPass()); // Clean up disgusting code
+    PM->add(createPromoteMemoryToRegisterPass());// Kill useless allocas
+
+#ifndef INSTCOMBINE_BUG
+    PM->add(createInstructionCombiningPass()); // Cleanup for scalarrepl.
+#endif
+    PM->add(createSROAPass());                 // Break up aggregate allocas
+#ifndef INSTCOMBINE_BUG
+    PM->add(createInstructionCombiningPass()); // Cleanup for scalarrepl.
+#endif
+    PM->add(createJumpThreadingPass());        // Thread jumps.
+    // NOTE: CFG simp passes after this point seem to hurt native codegen.
+    // See issue #6112. Should be re-evaluated when we switch to MCJIT.
+    //FPM->add(createCFGSimplificationPass());    // Merge & remove BBs
+#ifndef INSTCOMBINE_BUG
+    PM->add(createInstructionCombiningPass()); // Combine silly seq's
+#endif
+
+    //FPM->add(createCFGSimplificationPass());    // Merge & remove BBs
+    PM->add(createReassociatePass());          // Reassociate expressions
+
+    // this has the potential to make some things a bit slower
+    //FPM->add(createBBVectorizePass());
+
+    PM->add(createEarlyCSEPass()); //// ****
+
+    PM->add(createLoopIdiomPass()); //// ****
+    PM->add(createLoopRotatePass());           // Rotate loops.
+    // LoopRotate strips metadata from terminator, so run LowerSIMD afterwards
+    PM->add(createLowerSimdLoopPass());        // Annotate loop marked with "simdloop" as LLVM parallel loop
+    PM->add(createLICMPass());                 // Hoist loop invariants
+    PM->add(createLoopUnswitchPass());         // Unswitch loops.
+    // Subsequent passes not stripping metadata from terminator
+#ifndef INSTCOMBINE_BUG
+    PM->add(createInstructionCombiningPass());
+#endif
+    PM->add(createIndVarSimplifyPass());       // Canonicalize indvars
+    PM->add(createLoopDeletionPass());         // Delete dead loops
+#if defined(LLVM35)
+    PM->add(createSimpleLoopUnrollPass());     // Unroll small loops
+#else
+    PM->add(createLoopUnrollPass());           // Unroll small loops
+#endif
+#if !defined(LLVM35) && !defined(INSTCOMBINE_BUG)
+    PM->add(createLoopVectorizePass());        // Vectorize loops
+#endif
+    //FPM->add(createLoopStrengthReducePass());   // (jwb added)
+
+#ifndef INSTCOMBINE_BUG
+    PM->add(createInstructionCombiningPass()); // Clean up after the unroller
+#endif
+    PM->add(createGVNPass());                  // Remove redundancies
+    //FPM->add(createMemCpyOptPass());            // Remove memcpy / form memset
+    PM->add(createSCCPPass());                 // Constant prop with SCCP
+
+    // Run instcombine after redundancy elimination to exploit opportunities
+    // opened up by them.
+    PM->add(createSinkingPass()); ////////////// ****
+    PM->add(createInstructionSimplifierPass());///////// ****
+#ifndef INSTCOMBINE_BUG
+    PM->add(createInstructionCombiningPass());
+#endif
+    PM->add(createJumpThreadingPass());         // Thread jumps
+    PM->add(createDeadStoreEliminationPass());  // Delete dead stores
+#if !defined(INSTCOMBINE_BUG)
+    if (jl_options.opt_level>=1)
+        PM->add(createSLPVectorizerPass());     // Vectorize straight-line code
+#endif
+
+    PM->add(createAggressiveDCEPass());         // Delete dead instructions
+#if !defined(INSTCOMBINE_BUG)
+    if (jl_options.opt_level>=1)
+        PM->add(createInstructionCombiningPass());   // Clean up after SLP loop vectorizer
+#endif
+#if defined(LLVM35)
+    PM->add(createLoopVectorizePass());         // Vectorize loops
+    PM->add(createInstructionCombiningPass());  // Clean up after loop vectorizer
+#endif
+    //FPM->add(createCFGSimplificationPass());     // Merge & remove BBs
+}
+
 #ifdef USE_ORCJIT
 
 // ------------------------ TEMPORARILY COPIED FROM LLVM -----------------
@@ -145,6 +259,7 @@ public:
             new SectionMemoryManager
 #endif
             ) {
+            addOptimizationPasses(&PM);
             if (TM.addPassesToEmitMC(PM, Ctx, ObjStream))
                 llvm_unreachable("Target does not support MC emission.");
 

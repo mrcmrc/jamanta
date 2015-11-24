@@ -134,42 +134,55 @@ static GlobalValue *realize_pending_global(Instruction *User, GlobalValue *G, st
     return FixedGlobals[M];
 }
 
+struct ExprChain {
+    ConstantExpr *Expr;
+    unsigned OpNo;
+    struct ExprChain *Next;
+};
+
+static bool handleUse(Use &Use1,llvm::GlobalValue *G,std::map<llvm::Module*,llvm::GlobalValue*> &FixedGlobals,struct ExprChain *Chain, struct ExprChain *ChainEnd)
+{
+    Instruction *User = dyn_cast<Instruction>(Use1.getUser());
+    if (!User) {
+        ConstantExpr *Expr = dyn_cast<ConstantExpr>(Use1.getUser());
+        assert(Expr);
+        Value::use_iterator UI2 = Expr->use_begin(), E2 = Expr->use_end();
+        for (; UI2 != E2;) {
+            Use &Use2 = *UI2;
+             ++UI2;
+             struct ExprChain NextChain;
+             NextChain.Expr = Expr;
+             NextChain.OpNo = Use1.getOperandNo();
+             NextChain.Next = nullptr;
+             if (ChainEnd)
+                ChainEnd->Next = &NextChain;
+             handleUse(Use2,G,FixedGlobals,Chain ? Chain : &NextChain,&NextChain);
+        }
+        return true;
+    }
+    llvm::Constant *Replacement = realize_pending_global(User,G,FixedGlobals);
+    if (!Replacement)
+        return false;
+    while (Chain) {
+        Replacement = Chain->Expr->getWithOperandReplaced(Chain->OpNo,Replacement);
+        Chain = Chain->Next;
+    }
+    Use1.set(Replacement);
+    return true;
+}
+
 // RAUW, but only for those users which live in a module, and create a module
 // specific copy
 static void realize_pending_globals()
 {
     std::set<llvm::GlobalValue *> local_pending_globals;
     std::swap(local_pending_globals,pending_globals);
-    GlobalValue *Replacement;
     for (auto *G : local_pending_globals) {
         std::map<llvm::Module*,llvm::GlobalValue*> FixedGlobals;
         Value::use_iterator UI = G->use_begin(), E = G->use_end();
-        for (; UI != E;) {
-            Use &Use1 = *UI;
-            ++UI;
-            Instruction *User = dyn_cast<Instruction>(Use1.getUser());
-            if (!User) {
-                // Handle bit casts and getelementptrs
-                ConstantExpr *Expr = dyn_cast<ConstantExpr>(Use1.getUser());
-                assert(Expr);
-                Value::use_iterator UI2 = Expr->use_begin(), E2 = Expr->use_end();
-                for (; UI2 != E2;) {
-                    Use &Use2 = *UI2;
-                    ++UI2;
-                    Instruction *User2 = dyn_cast<Instruction>(Use2.getUser());
-                    assert(User2);
-                    Replacement = realize_pending_global(User2,G,FixedGlobals);
-                    if (!Replacement)
-                        continue;
-                    Use2.set(Expr->getWithOperandReplaced(Use1.getOperandNo(),Replacement));
-                }
+        for (; UI != E;)
+            if (!handleUse(*(UI++),G,FixedGlobals,nullptr,nullptr))
                 continue;
-            }
-            Replacement = realize_pending_global(User,G,FixedGlobals);
-            if (!Replacement)
-                continue;
-            Use1.set(Replacement);
-        }
     }
 }
 

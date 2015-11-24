@@ -179,6 +179,11 @@ static TargetMachine *jl_TargetMachine;
 
 extern JITEventListener* CreateJuliaJITEventListener();
 
+namespace llvm {
+    extern Pass *createLowerSimdLoopPass();
+    extern bool annotateSimdLoop( BasicBlock* latch );
+}
+
 #include "jitlayers.cpp"
 
 #ifdef USE_ORCJIT
@@ -267,11 +272,6 @@ static MDNode* tbaa_sveclen;           // The len in a jl_svec_t
 static MDNode* tbaa_func;           // A jl_function_t
 static MDNode* tbaa_datatype;       // A jl_datatype_t
 static MDNode* tbaa_const;          // Memory that is immutable by the time LLVM can see it
-
-namespace llvm {
-    extern Pass *createLowerSimdLoopPass();
-    extern bool annotateSimdLoop( BasicBlock* latch );
-}
 
 // Basic DITypes
 #ifdef LLVM37
@@ -959,6 +959,7 @@ static uint64_t getAddressForOrCompileFunction(llvm::Function *llvmf)
         return jl_ExecutionEngine->getFunctionAddress(llvmf->getName());
     if (!imaging_mode) {
         realize_pending_globals();
+        #ifndef USE_ORCJIT
         #ifdef JL_DEBUG_BUILD
         Module *backup = llvm::CloneModule(active_module);
         if(verifyModule(*active_module))
@@ -981,6 +982,7 @@ static uint64_t getAddressForOrCompileFunction(llvm::Function *llvmf)
         if(verifyModule(*active_module))
             writeRecoveryFile(backup);
         delete backup;
+        #endif
         #endif
         jl_finalize_module(active_module);
     }
@@ -6032,116 +6034,7 @@ static void init_julia_llvm_env(Module *m)
 #ifndef LLVM37
     FPM->add(jl_data_layout);
 #endif
-
-#ifdef __has_feature
-#   if __has_feature(address_sanitizer)
-#   if defined(LLVM37) && !defined(LLVM38)
-    // LLVM 3.7 BUG: ASAN pass doesn't properly initialize its dependencies
-    initializeTargetLibraryInfoWrapperPassPass(*PassRegistry::getPassRegistry());
-#   endif
-    FPM->add(createAddressSanitizerFunctionPass());
-#   endif
-#   if __has_feature(memory_sanitizer)
-    FPM->add(llvm::createMemorySanitizerPass(true));
-#   endif
-#endif
-#ifdef LLVM37
-    FPM->add(createTargetTransformInfoWrapperPass(jl_TargetMachine->getTargetIRAnalysis()));
-#else
-    jl_TargetMachine->addAnalysisPasses(*FPM);
-#endif
-#ifdef LLVM38
-    FPM->add(createTypeBasedAAWrapperPass());
-#else
-    FPM->add(createTypeBasedAliasAnalysisPass());
-#endif
-    if (jl_options.opt_level>=1) {
-#ifdef LLVM38
-        FPM->add(createBasicAAWrapperPass());
-#else
-        FPM->add(createBasicAliasAnalysisPass());
-#endif
-    }
-    // list of passes from vmkit
-    FPM->add(createCFGSimplificationPass()); // Clean up disgusting code
-    FPM->add(createPromoteMemoryToRegisterPass());// Kill useless allocas
-
-#ifndef INSTCOMBINE_BUG
-    FPM->add(createInstructionCombiningPass()); // Cleanup for scalarrepl.
-#endif
-    FPM->add(createSROAPass());                 // Break up aggregate allocas
-#ifndef INSTCOMBINE_BUG
-    FPM->add(createInstructionCombiningPass()); // Cleanup for scalarrepl.
-#endif
-    FPM->add(createJumpThreadingPass());        // Thread jumps.
-    // NOTE: CFG simp passes after this point seem to hurt native codegen.
-    // See issue #6112. Should be re-evaluated when we switch to MCJIT.
-    //FPM->add(createCFGSimplificationPass());    // Merge & remove BBs
-#ifndef INSTCOMBINE_BUG
-    FPM->add(createInstructionCombiningPass()); // Combine silly seq's
-#endif
-
-    //FPM->add(createCFGSimplificationPass());    // Merge & remove BBs
-    FPM->add(createReassociatePass());          // Reassociate expressions
-
-    // this has the potential to make some things a bit slower
-    //FPM->add(createBBVectorizePass());
-
-    FPM->add(createEarlyCSEPass()); //// ****
-
-    FPM->add(createLoopIdiomPass()); //// ****
-    FPM->add(createLoopRotatePass());           // Rotate loops.
-    // LoopRotate strips metadata from terminator, so run LowerSIMD afterwards
-    FPM->add(createLowerSimdLoopPass());        // Annotate loop marked with "simdloop" as LLVM parallel loop
-    FPM->add(createLICMPass());                 // Hoist loop invariants
-    FPM->add(createLoopUnswitchPass());         // Unswitch loops.
-    // Subsequent passes not stripping metadata from terminator
-#ifndef INSTCOMBINE_BUG
-    FPM->add(createInstructionCombiningPass());
-#endif
-    FPM->add(createIndVarSimplifyPass());       // Canonicalize indvars
-    FPM->add(createLoopDeletionPass());         // Delete dead loops
-#if defined(LLVM35)
-    FPM->add(createSimpleLoopUnrollPass());     // Unroll small loops
-#else
-    FPM->add(createLoopUnrollPass());           // Unroll small loops
-#endif
-#if !defined(LLVM35) && !defined(INSTCOMBINE_BUG)
-    FPM->add(createLoopVectorizePass());        // Vectorize loops
-#endif
-    //FPM->add(createLoopStrengthReducePass());   // (jwb added)
-
-#ifndef INSTCOMBINE_BUG
-    FPM->add(createInstructionCombiningPass()); // Clean up after the unroller
-#endif
-    FPM->add(createGVNPass());                  // Remove redundancies
-    //FPM->add(createMemCpyOptPass());            // Remove memcpy / form memset
-    FPM->add(createSCCPPass());                 // Constant prop with SCCP
-
-    // Run instcombine after redundancy elimination to exploit opportunities
-    // opened up by them.
-    FPM->add(createSinkingPass()); ////////////// ****
-    FPM->add(createInstructionSimplifierPass());///////// ****
-#ifndef INSTCOMBINE_BUG
-    FPM->add(createInstructionCombiningPass());
-#endif
-    FPM->add(createJumpThreadingPass());         // Thread jumps
-    FPM->add(createDeadStoreEliminationPass());  // Delete dead stores
-#if !defined(INSTCOMBINE_BUG)
-    if (jl_options.opt_level>=1)
-        FPM->add(createSLPVectorizerPass());     // Vectorize straight-line code
-#endif
-
-    FPM->add(createAggressiveDCEPass());         // Delete dead instructions
-#if !defined(INSTCOMBINE_BUG)
-    if (jl_options.opt_level>=1)
-        FPM->add(createInstructionCombiningPass());   // Clean up after SLP loop vectorizer
-#endif
-#if defined(LLVM35)
-    FPM->add(createLoopVectorizePass());         // Vectorize loops
-    FPM->add(createInstructionCombiningPass());  // Clean up after loop vectorizer
-#endif
-    //FPM->add(createCFGSimplificationPass());     // Merge & remove BBs
+    addOptimizationPasses(FPM);
     FPM->doInitialization();
 }
 
