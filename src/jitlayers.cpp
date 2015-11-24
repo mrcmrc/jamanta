@@ -367,7 +367,9 @@ public:
 private:
     TargetMachine &TM;
     const DataLayout DL;
-    SmallVector<char, 0> ObjBufferSV;
+    // Should be big enough that in the common case, The
+    // object fits in its entirety
+    SmallVector<char, 4096> ObjBufferSV;
     raw_svector_ostream ObjStream;
     legacy::PassManager PM;
     MCContext *Ctx;
