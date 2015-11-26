@@ -355,6 +355,7 @@ public:
 
     Function *CloneFunctionProto(Function *F)
     {
+        assert(!F->isDeclaration());
         Function *NewF = Function::Create(F->getFunctionType(),
                                           Function::ExternalLinkage,
                                           F->getName(),
@@ -442,7 +443,7 @@ public:
                     if (jl_ExecutionEngine->FindFunctionNamed(F->getName().data()))
                         return InjectFunctionProto(F);
 
-                    return CloneFunctionProto(F);
+                    return CloneFunctionProto(shadow);
                 }
                 else if (!F->isDeclaration()) {
                     return CloneFunctionProto(F);
