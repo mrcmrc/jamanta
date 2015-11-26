@@ -201,6 +201,8 @@ static RTDyldMemoryManager *jl_mcjmm;
 #else
 static Module *jl_Module;
 #define shadow_module jl_Module
+#define active_module jl_Module
+#define builtins_module jl_Module
 #endif
 static MDBuilder *mbuilder;
 static std::map<int, std::string> argNumberStrings;
@@ -831,6 +833,7 @@ static Function *to_function(jl_lambda_info_t *li, jl_cyclectx_t *cyclectx)
     jl_gc_inhibit_finalizers(nested_compile);
     Function *f = NULL;
     JL_TRY {
+        #if defined(USE_MCJIT) || defined(USE_ORCJIT)
         jl_cyclectx_t *newcyclectx = cyclectx;
         if (!newcyclectx)
             newcyclectx = new jl_cyclectx_t;
@@ -840,6 +843,9 @@ static Function *to_function(jl_lambda_info_t *li, jl_cyclectx_t *cyclectx)
             realize_cycle(newcyclectx);
             delete newcyclectx;
         }
+        #else
+        f = emit_function(li, nullptr);
+        #endif
         //n_emit++;
     }
     JL_CATCH {
@@ -929,6 +935,7 @@ static void jl_finalize_module(Module *m)
 #endif
 }
 
+#if defined(USE_MCJIT) || defined(USE_ORCJIT)
 static void writeRecoveryFile(llvm::Module *mod)
 {
     std::error_code err;
@@ -994,6 +1001,7 @@ static uint64_t getAddressForOrCompileFunction(llvm::Function *llvmf)
     }
     return addr;
 }
+#endif
 
 extern "C" void jl_generate_fptr(jl_function_t *f)
 {
@@ -5276,7 +5284,9 @@ static Function *emit_function(jl_lambda_info_t *lam, jl_cyclectx_t *cyclectx)
 
     // step 18. Perform any delayed instantiations
     if (ctx.debug_enabled) {
+#if defined(USE_MCJIT) || defined(USE_ORCJIT)
         cyclectx->CUs.push_back(CU);
+#endif
         ctx.dbuilder->finalize();
     }
 

@@ -29,7 +29,7 @@ static Instruction *tbaa_decorate(MDNode* md, Instruction* load_or_store)
     return load_or_store;
 }
 
-GlobalVariable *IRBuilderBase::CreateGlobalString(StringRef Str,
+static GlobalVariable *CreateGlobalString(StringRef Str,
                                                   const Twine &Name,
                                                   unsigned AddressSpace) {
   Constant *StrConstant = ConstantDataArray::getString(jl_LLVMContext, Str);
@@ -44,12 +44,16 @@ GlobalVariable *IRBuilderBase::CreateGlobalString(StringRef Str,
 
 /// \brief Same as CreateGlobalString, but return a pointer with "i8*" type
 /// instead of a pointer to array of i8.
-Value *CreateGlobalStringPtr(llvm::IRBuilder<> *Builder, StringRef Str, const Twine &Name = "",
+static Value *CreateGlobalStringPtr(llvm::IRBuilder<> *Builder, StringRef Str, const Twine &Name = "",
                            unsigned AddressSpace = 0) {
-    GlobalVariable *gv = Builder->CreateGlobalString(Str, Name, AddressSpace);
+    GlobalVariable *gv = CreateGlobalString(Str, Name, AddressSpace);
     Value *zero = ConstantInt::get(Type::getInt32Ty(jl_LLVMContext), 0);
     Value *Args[] = { zero, zero };
+#ifdef LLVM37
     return Builder->CreateInBoundsGEP(gv->getValueType(), gv, Args, Name);
+#else
+    return Builder->CreateInBoundsGEP(gv, Args, Name);
+#endif
 }
 
 
@@ -70,6 +74,7 @@ static llvm::Value *prepare_call(llvm::Value* Callee)
     return Callee;
 }
 
+#if defined(USE_MCJIT) || defined(USE_ORCJIT)
 static GlobalValue *realize_pending_global(Instruction *User, GlobalValue *G, std::map<llvm::Module*,llvm::GlobalValue*> &FixedGlobals)
 {
     Function *UsedInHere = User->getParent()->getParent();
@@ -87,7 +92,7 @@ static GlobalValue *realize_pending_global(Instruction *User, GlobalValue *G, st
         return nullptr;
     }
     if (!FixedGlobals.count(M)) {
-        if (auto *GV = dyn_cast<GlobalVariable>(G)) {
+        if (GlobalVariable *GV = dyn_cast<GlobalVariable>(G)) {
             GlobalVariable *NewGV = M->getGlobalVariable(GV->getName());
             if (!NewGV) {
                 NewGV = new GlobalVariable(*M, GV->getType()->getElementType(),
@@ -198,7 +203,7 @@ static void realize_cycle(jl_cyclectx_t *cyclectx)
         NMD->addOperand(CU);
     }
 }
-
+#endif
 
 #ifdef LLVM35
 static inline void add_named_global(GlobalObject *gv, void *addr, bool dllimport = true)
@@ -303,6 +308,7 @@ JL_DLLEXPORT std::map<Value *, void*> jl_llvm_to_jl_value;
 // because this is queried in the hot path
 static std::map<Function *, uint64_t> emitted_function_symtab;
 
+#if defined(USE_MCJIT) || defined(USE_ORCJIT)
 static Function *function_proto(Function *F) {
     Function *NewF = Function::Create(F->getFunctionType(),
                             Function::ExternalLinkage,
@@ -313,9 +319,11 @@ static Function *function_proto(Function *F) {
     // as codegen may make decisions based on the presence of certain attributes
     NewF->copyAttributesFrom(F);
 
+#ifdef LLVM37
     // Declarations are not allowed to have personality routines, but
     // copyAttributesFrom sets them anyway, so clear them again manually
     NewF->setPersonalityFn(nullptr);
+#endif
 
     AttributeSet OldAttrs = F->getAttributes();
     // Clone any argument attributes that are present in the VMap.
@@ -338,7 +346,6 @@ static Function *function_proto(Function *F) {
     return NewF;
 }
 
-#ifdef USE_MCJIT
 class FunctionMover : public ValueMaterializer
 {
 public:
@@ -492,6 +499,10 @@ public:
         return NULL;
     };
 };
+#else
+static Function *function_proto(Function *F) {
+    return F;
+}
 #endif
 
 #ifdef LLVM37
@@ -660,7 +671,9 @@ static void jl_gen_llvm_globaldata(llvm::Module *mod, ValueToValueMapTy &VMap, c
 
 static void jl_dump_shadow(char *fname, int jit_model, const char *sysimg_data, size_t sysimg_len, bool dump_as_bc)
 {
+#if defined(USE_MCJIT) || defined(USE_ORCJIT)
     realize_pending_globals();
+#endif
     //shadow_module->dump();
     verifyModule(*shadow_module);
 
