@@ -844,7 +844,7 @@ static Function *to_function(jl_lambda_info_t *li, jl_cyclectx_t *cyclectx)
             delete newcyclectx;
         }
         #else
-        f = emit_function(li, nullptr);
+        f = emit_function(li, NULL);
         #endif
         //n_emit++;
     }
@@ -4467,7 +4467,7 @@ static Function *emit_function(jl_lambda_info_t *lam, jl_cyclectx_t *cyclectx)
     // try to avoid conflicts in the global symbol table
     funcName << "julia_" << jl_symbol_name(lam->name);
 
-    Function *fwrap = nullptr;
+    Function *fwrap = NULL;
     funcName << "_" << globalUnique++;
 
     ctx.sret = false;
@@ -5278,9 +5278,11 @@ static Function *emit_function(jl_lambda_info_t *lam, jl_cyclectx_t *cyclectx)
         inlinef->eraseFromParent();
     }
 
+#if defined(USE_MCJIT) || defined(USE_ORCJIT)
     cyclectx->functions.push_back(f);
     if (fwrap)
         cyclectx->functions.push_back(fwrap);
+#endif
 
     // step 18. Perform any delayed instantiations
     if (ctx.debug_enabled) {
