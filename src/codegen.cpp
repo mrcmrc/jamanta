@@ -816,7 +816,8 @@ void jl_dump_compiles(void *s)
 
 // --- entry point ---
 //static int n_emit=0;
-static Function *emit_function(jl_lambda_info_t *lam, jl_cyclectx_t *cyclectx);
+static void emit_function(jl_lambda_info_t *lam, jl_llvm_functions_t *declarations,
+    jl_llvm_functions_t *definitions, jl_cyclectx_t *cyclectx);
 static void jl_finalize_module(Module *m);
 //static int n_compile=0;
 static Function *to_function(jl_lambda_info_t *li, jl_cyclectx_t *cyclectx)
@@ -833,25 +834,31 @@ static Function *to_function(jl_lambda_info_t *li, jl_cyclectx_t *cyclectx)
     jl_gc_inhibit_finalizers(nested_compile);
     Function *f = NULL;
     JL_TRY {
+        jl_llvm_functions_t definitions;
         #if defined(USE_MCJIT) || defined(USE_ORCJIT)
         jl_cyclectx_t *newcyclectx = cyclectx;
         if (!newcyclectx)
             newcyclectx = new jl_cyclectx_t;
-        f = emit_function(li, newcyclectx);
+        emit_function(li, &li->functionObjects, &definitions, newcyclectx);
         // If we're the root of the cycle, realize all functions
         if (!cyclectx) {
             realize_cycle(newcyclectx);
             delete newcyclectx;
         }
         #else
-        f = emit_function(li, NULL);
+        emit_function(li, &li->functionObjects, &definitions, NULL);
         #endif
+        f = (llvm::Function*)(definitions.specFunctionObject ?
+            definitions.specFunctionObject : definitions.functionObject);
+        li->functionID = jl_assign_functionID((llvm::Function*)definitions.functionObject);
+        if (definitions.specFunctionObject)
+            li->specFunctionID = jl_assign_functionID((llvm::Function*)definitions.specFunctionObject);
         //n_emit++;
     }
     JL_CATCH {
-        li->functionObject = NULL;
-        li->specFunctionObject = NULL;
-        li->cFunctionList = NULL;
+        li->functionObjects.functionObject = NULL;
+        li->functionObjects.specFunctionObject = NULL;
+        li->functionObjects.cFunctionList = NULL;
         nested_compile = last_n_c;
         if (old != NULL) {
             builder.SetInsertPoint(old);
@@ -862,18 +869,10 @@ static Function *to_function(jl_lambda_info_t *li, jl_cyclectx_t *cyclectx)
         jl_rethrow_with_add("error compiling %s", jl_symbol_name(li->name));
     }
     assert(f != NULL);
+#if defined(USE_MCJIT) || defined(ORCJIT)
     if (imaging_mode)
+#endif
         FPM->run(*f);
-    //n_compile++;
-    // print out the function's LLVM code
-    // jl_static_show(JL_STDERR, (jl_value_t*)li);
-    // jl_printf(JL_STDERR, "%s:%d\n",
-    //           jl_symbol_name((jl_sym_t*)li->file), li->line);
-    //f->dump();
-    //if (verifyFunction(*f,PrintMessageAction)) {
-    //    f->dump();
-    //    abort();
-    //}
     if (old != NULL) {
         builder.SetInsertPoint(old);
         builder.SetCurrentDebugLocation(olddl);
@@ -1008,7 +1007,7 @@ extern "C" void jl_generate_fptr(jl_function_t *f)
     JL_LOCK(codegen);
     // objective: assign li->fptr
     jl_lambda_info_t *li = f->linfo;
-    assert(li->functionObject);
+    assert(li->functionObjects.functionObject);
     if (li->fptr == &jl_trampoline) {
         JL_SIGATOMIC_BEGIN();
         #ifdef USE_MCJIT
@@ -1017,34 +1016,34 @@ extern "C" void jl_generate_fptr(jl_function_t *f)
             Module *m = new Module("julia", jl_LLVMContext);
             jl_setup_module(m);
             FunctionMover mover(m, shadow_module);
-            mover.CloneFunction((Function*)li->functionObject);
-            if (li->specFunctionObject != NULL)
-                mover.CloneFunction((Function*)li->specFunctionObject);
-            if (li->cFunctionList != NULL) {
+            mover.CloneFunction((Function*)li->functionObjects.functionObject);
+            if (li->functionObjects.specFunctionObject != NULL)
+                mover.CloneFunction((Function*)li->functionObjects.specFunctionObject);
+            if (li->functionObjects.cFunctionList != NULL) {
                 size_t i;
-                cFunctionList_t *list = (cFunctionList_t*)li->cFunctionList;
+                cFunctionList_t *list = (cFunctionList_t*)li->functionObjects.cFunctionList;
                 for (i = 0; i < list->len; i++) {
                     list->data()[i].f = mover.CloneFunction(list->data()[i].f);
                 }
             }
             jl_finalize_module(m);
-            li->fptr = (jl_fptr_t)jl_ExecutionEngine->getFunctionAddress(((Function*)li->functionObject)->getName());
+            li->fptr = (jl_fptr_t)jl_ExecutionEngine->getFunctionAddress(((Function*)li->functionObjects.functionObject)->getName());
         } else {
-            li->fptr = (jl_fptr_t)getAddressForOrCompileFunction((Function*)li->functionObject);
+            li->fptr = (jl_fptr_t)getAddressForOrCompileFunction((Function*)li->functionObjects.functionObject);
         }
         #else
-        li->fptr = (jl_fptr_t)jl_ExecutionEngine->getPointerToFunction((Function*)li->functionObject);
+        li->fptr = (jl_fptr_t)jl_ExecutionEngine->getPointerToFunction((Function*)li->functionObjects.functionObject);
         #endif
 
         assert(li->fptr != NULL);
 #ifndef KEEP_BODIES
         if (!imaging_mode)
-            ((Function*)li->functionObject)->deleteBody();
+            ((Function*)li->functionObjects.functionObject)->deleteBody();
 #endif
 
-        if (li->cFunctionList != NULL) {
+        if (li->functionObjects.cFunctionList != NULL) {
             size_t i;
-            cFunctionList_t *list = (cFunctionList_t*)li->cFunctionList;
+            cFunctionList_t *list = (cFunctionList_t*)li->functionObjects.cFunctionList;
             for (i = 0; i < list->len; i++) {
 #ifdef USE_MCJIT
                 (void)getAddressForOrCompileFunction(list->data()[i].f);
@@ -1059,18 +1058,18 @@ extern "C" void jl_generate_fptr(jl_function_t *f)
             }
         }
 
-        if (li->specFunctionObject != NULL) {
+        if (li->functionObjects.specFunctionObject != NULL) {
 #ifdef USE_MCJIT
             if (imaging_mode)
-              (void)jl_ExecutionEngine->getFunctionAddress(((Function*)li->specFunctionObject)->getName());
+              (void)jl_ExecutionEngine->getFunctionAddress(((Function*)li->functionObjects.specFunctionObject)->getName());
             else
-              (void)getAddressForOrCompileFunction((Function*)li->specFunctionObject);
+              (void)getAddressForOrCompileFunction((Function*)li->functionObjects.specFunctionObject);
 #else
-            (void)jl_ExecutionEngine->getPointerToFunction((Function*)li->specFunctionObject);
+            (void)jl_ExecutionEngine->getPointerToFunction((Function*)li->functionObjects.specFunctionObject);
 #endif
 #ifndef KEEP_BODIES
             if (!imaging_mode)
-                ((Function*)li->specFunctionObject)->deleteBody();
+                ((Function*)li->functionObjects.specFunctionObject)->deleteBody();
 #endif
         }
         JL_SIGATOMIC_END();
@@ -1081,7 +1080,7 @@ extern "C" void jl_generate_fptr(jl_function_t *f)
 
 extern "C" void jl_compile_linfo(jl_lambda_info_t *li, void *cyclectx)
 {
-    if (li->functionObject == NULL) {
+    if (li->functionObjects.functionObject == NULL) {
         // objective: assign li->functionObject
         li->inCompile = 1;
         (void)to_function(li, (jl_cyclectx_t *)cyclectx);
@@ -1288,30 +1287,70 @@ void *jl_get_llvmf(jl_function_t *f, jl_tupletype_t *tt, bool getwrapper)
         return NULL;
     }
 
-    if (linfo->specFunctionObject != NULL) {
+#if defined(USE_ORCJIT) || defined(USE_MCJIT)
+    if (linfo->functionObjects.functionObject == NULL && linfo->functionObjects.specFunctionObject == NULL) {
+        jl_compile_linfo(linfo, NULL);
+    }
+    Function *llvmDecl = nullptr;
+    if (!getwrapper && linfo->functionObjects.specFunctionObject != NULL)
+        llvmDecl = (Function*)linfo->functionObjects.specFunctionObject;
+    else
+        llvmDecl = (Function*)linfo->functionObjects.functionObject;
+
+    Function *llvmf = active_module->getFunction(llvmDecl->getName());
+    // Not in active module anymore, recompile
+    if (!llvmf) {
+        Function *other;
+        jl_llvm_functions_t declarations;
+        emit_function(linfo, nullptr, &declarations, nullptr);
+        if (getwrapper || !declarations.specFunctionObject) {
+            llvmf = (llvm::Function*)declarations.functionObject;
+            other = (llvm::Function*)declarations.specFunctionObject;
+        } else {
+            llvmf = (llvm::Function*)declarations.specFunctionObject;
+            other = (llvm::Function*)declarations.functionObject;
+        }
+        other->eraseFromParent();
+        llvmf = (llvm::Function*)declarations.specFunctionObject;
+        FPM->run(*llvmf);
+        llvmf->removeFromParent();
+    } else {
+        ValueToValueMapTy VMap;
+        llvmf = CloneFunction(llvmf,VMap,false);
+        active_module->getFunctionList().push_back(llvmf);
+        FPM->run(*llvmf);
+        llvmf->removeFromParent();
+    }
+    // We need to run the FPM manually, since this is now usually done
+    // as part of object emission
+    return llvmf;
+#else
+    if (linfo->functionObjects.specFunctionObject != NULL) {
         // found in the system image: force a recompile
-        Function *llvmf = (Function*)linfo->specFunctionObject;
+        Function *llvmf = (Function*)linfo->functionObjects.specFunctionObject;
         if (llvmf->isDeclaration()) {
-            linfo->specFunctionObject = NULL;
-            linfo->functionObject = NULL;
+            linfo->functionObjects.specFunctionObject = NULL;
+            linfo->functionObjects.functionObject = NULL;
         }
     }
-    if (linfo->functionObject != NULL) {
+    if (linfo->functionObjects.functionObject != NULL) {
         // found in the system image: force a recompile
-        Function *llvmf = (Function*)linfo->functionObject;
+        Function *llvmf = (Function*)linfo->functionObjects.functionObject;
         if (llvmf->isDeclaration()) {
-            linfo->specFunctionObject = NULL;
-            linfo->functionObject = NULL;
+            linfo->functionObjects.specFunctionObject = NULL;
+            linfo->functionObjects.functionObject = NULL;
         }
     }
-    if (linfo->functionObject == NULL && linfo->specFunctionObject == NULL) {
+    if (linfo->functionObjects.functionObject == NULL &&
+        linfo->functionObjects.specFunctionObject == NULL) {
         jl_compile_linfo(linfo, NULL);
     }
     JL_GC_POP();
-    if (!getwrapper && linfo->specFunctionObject != NULL)
-        return (Function*)linfo->specFunctionObject;
+    if (!getwrapper && linfo->functionObjects.specFunctionObject != NULL)
+        return (Function*)linfo->functionObjects.specFunctionObject;
     else
-        return (Function*)linfo->functionObject;
+        return (Function*)linfo->functionObjects.functionObject;
+#endif
 }
 
 Function* CloneFunctionToModule(Function *F, Module *destModule)
@@ -1349,10 +1388,13 @@ const jl_value_t *jl_dump_function_ir(void *f, bool strip_ir_metadata, bool dump
         llvmf->print(stream);
     }
     else {
-        // make a copy of the function with all module metadata
+        if (llvmf->getParent())
+            jl_error("jl_dump_function_ir requires a parentless clone");
+        // Put the function in a module
         Module *m = new Module(llvmf->getName(), jl_LLVMContext);
         jl_setup_module(m);
-        Function *f2 = CloneFunctionToModule(llvmf, m);
+        m->getFunctionList().push_back(llvmf);
+        Function *f2 = llvmf;
         if (strip_ir_metadata) {
             // strip metadata from the copy
             Function::BasicBlockListType::iterator f2_bb = f2->getBasicBlockList().begin();
@@ -2360,8 +2402,8 @@ static bool emit_known_call(jl_cgval_t *ret, jl_value_t *ff,
                 */
                 f = jl_get_specialization(f, (jl_tupletype_t*)rt1, (void*)ctx->cyclectx);
                 if (f != NULL) {
-                    assert(f->linfo->functionObject != NULL);
-                    *theFptr = (Value*)f->linfo->functionObject;
+                    assert(f->linfo->functionObjects.functionObject != NULL);
+                    *theFptr = (Value*)f->linfo->functionObjects.functionObject;
                     *theF = f;
                 }
             }
@@ -2920,12 +2962,12 @@ static jl_cgval_t emit_call_function_object(jl_function_t *f, Value *theF, Value
                                         jl_value_t **args, size_t nargs,
                                         jl_codectx_t *ctx)
 {
-    if (f!=NULL && specialized && f->linfo!=NULL && f->linfo->specFunctionObject != NULL) {
+    if (f!=NULL && specialized && f->linfo!=NULL && f->linfo->functionObjects.specFunctionObject != NULL) {
         // emit specialized call site
         jl_value_t *jlretty = jl_ast_rettype(f->linfo, f->linfo->ast);
         bool retboxed;
         (void)julia_type_to_llvm(jlretty, &retboxed);
-        Function *cf = (Function*)f->linfo->specFunctionObject;
+        Function *cf = (Function*)f->linfo->functionObjects.specFunctionObject;
         if (!cf->getParent() || (cf->getParent() == builtins_module &&
             builtins_module != active_module)) { // Call cycle
             prepare_call(cf);
@@ -3975,7 +4017,7 @@ static void finalize_gc_frame(jl_codectx_t *ctx)
 static Function *gen_cfun_wrapper(jl_function_t *ff, jl_value_t *jlrettype, jl_tupletype_t *argt, int64_t isref)
 {
     jl_lambda_info_t *lam = ff->linfo;
-    cFunctionList_t *list = (cFunctionList_t*)lam->cFunctionList;
+    cFunctionList_t *list = (cFunctionList_t*)lam->functionObjects.cFunctionList;
     if (list != NULL) {
         size_t i;
         for (i = 0; i < list->len; i++) {
@@ -4015,7 +4057,7 @@ static Function *gen_cfun_wrapper(jl_function_t *ff, jl_value_t *jlrettype, jl_t
         jl_error("va_arg syntax not allowed for cfunction argument list");
 
     jl_compile_linfo(lam, NULL);
-    if (!lam->functionObject) {
+    if (!lam->functionObjects.functionObject) {
         jl_errorf("error compiling %s while creating cfunction",
                   jl_symbol_name(lam->name));
     }
@@ -4060,18 +4102,18 @@ static Function *gen_cfun_wrapper(jl_function_t *ff, jl_value_t *jlrettype, jl_t
     list2->len = len;
     list2->data()[len-1].isref = isref;
     list2->data()[len-1].f = imaging_mode ? cw : cw_proto;
-    lam->cFunctionList = list2;
+    lam->functionObjects.cFunctionList = list2;
 
     // See whether this function is specsig or jlcall
     bool specsig, jlfunc_sret;
     Function *theFptr;
-    if (lam->specFunctionObject != NULL) {
-        theFptr = (Function*)lam->specFunctionObject;
+    if (lam->functionObjects.specFunctionObject != NULL) {
+        theFptr = (Function*)lam->functionObjects.specFunctionObject;
         specsig = true;
         jlfunc_sret = theFptr->hasStructRetAttr();
     }
     else {
-        theFptr = (Function*)lam->functionObject;
+        theFptr = (Function*)lam->functionObjects.functionObject;
         specsig = false;
         jlfunc_sret = false;
     }
@@ -4223,7 +4265,9 @@ static Function *gen_cfun_wrapper(jl_function_t *ff, jl_value_t *jlrettype, jl_t
         builder.CreateRet(r);
     finalize_gc_frame(&ctx);
 
+#if defined(USE_MCJIT) || defined(ORCJIT)
     if (imaging_mode)
+#endif
         FPM->run(*cw);
 
     cw->removeFromParent();
@@ -4319,8 +4363,11 @@ static Function *gen_jlcall_wrapper(jl_lambda_info_t *lam, jl_expr_t *ast, Funct
 }
 
 // Compile to LLVM IR, using a specialized signature if applicable.
-static Function *emit_function(jl_lambda_info_t *lam, jl_cyclectx_t *cyclectx)
+static void emit_function(jl_lambda_info_t *lam, jl_llvm_functions_t *declarations,
+    jl_llvm_functions_t *definitions, jl_cyclectx_t *cyclectx)
 {
+    assert(definitions && "Capturing definitions is always required");
+
     // step 1. unpack AST and allocate codegen context for this function
     jl_expr_t *ast = (jl_expr_t*)lam->ast;
     jl_svec_t *sparams = NULL;
@@ -4504,14 +4551,12 @@ static Function *emit_function(jl_lambda_info_t *lam, jl_cyclectx_t *cyclectx)
 #ifdef LLVM37
         f->addFnAttr("no-frame-pointer-elim", "true");
 #endif
-        if (lam->specFunctionObject == NULL) {
-            lam->specFunctionObject = (void*)imaging_mode ? f : function_proto(f);
-            lam->specFunctionID = jl_assign_functionID(f);
-        }
-        if (lam->functionObject == NULL) {
-            fwrap = gen_jlcall_wrapper(lam, ast, f, ctx.sret);
-            lam->functionObject = (void*)imaging_mode ? fwrap : function_proto(fwrap);
-            lam->functionID = jl_assign_functionID(fwrap);
+        fwrap = gen_jlcall_wrapper(lam, ast, f, ctx.sret);
+        definitions->specFunctionObject = f;
+        definitions->functionObject = fwrap;
+        if (declarations) {
+            declarations->specFunctionObject = function_proto(f);
+            declarations->functionObject = function_proto(fwrap);
         }
     }
     else {
@@ -4521,9 +4566,11 @@ static Function *emit_function(jl_lambda_info_t *lam, jl_cyclectx_t *cyclectx)
 #ifdef LLVM37
         f->addFnAttr("no-frame-pointer-elim", "true");
 #endif
-        if (lam->functionObject == NULL) {
-            lam->functionObject = (void*)imaging_mode ? f : function_proto(f);
-            lam->functionID = jl_assign_functionID(f);
+        definitions->functionObject = f;
+        definitions->specFunctionObject = NULL;
+        if (declarations) {
+            declarations->functionObject = function_proto(f);
+            declarations->specFunctionObject = NULL;
         }
     }
     if (jlrettype == (jl_value_t*)jl_bottom_type)
@@ -5279,22 +5326,25 @@ static Function *emit_function(jl_lambda_info_t *lam, jl_cyclectx_t *cyclectx)
     }
 
 #if defined(USE_MCJIT) || defined(USE_ORCJIT)
-    cyclectx->functions.push_back(f);
-    if (fwrap)
-        cyclectx->functions.push_back(fwrap);
+    if (cyclectx) {
+        cyclectx->functions.push_back(f);
+        if (fwrap)
+            cyclectx->functions.push_back(fwrap);
+    }
 #endif
 
     // step 18. Perform any delayed instantiations
     if (ctx.debug_enabled) {
 #if defined(USE_MCJIT) || defined(USE_ORCJIT)
-        cyclectx->CUs.push_back(CU);
+        if(cyclectx)
+            cyclectx->CUs.push_back(CU);
 #endif
         ctx.dbuilder->finalize();
     }
 
     JL_GC_POP();
 
-    return f;
+    return;
 }
 
 // --- initialization ---
@@ -5370,16 +5420,16 @@ extern "C" void jl_fptr_to_llvm(void *fptr, jl_lambda_info_t *lam, int specsig)
             if (sret)
                 f->addAttribute(1, Attribute::StructRet);
 
-        if (lam->specFunctionObject == NULL) {
-            lam->specFunctionObject = (void*)f;
+        if (lam->functionObjects.specFunctionObject == NULL) {
+            lam->functionObjects.specFunctionObject = (void*)f;
             lam->specFunctionID = jl_assign_functionID(f);
             }
             add_named_global(f, (void*)fptr);
         }
         else {
             Function *f = jlcall_func_to_llvm(funcName, fptr, shadow_module);
-            if (lam->functionObject == NULL) {
-                lam->functionObject = (void*)f;
+            if (lam->functionObjects.functionObject == NULL) {
+                lam->functionObjects.functionObject = (void*)f;
                 lam->functionID = jl_assign_functionID(f);
                 assert(lam->fptr == &jl_trampoline);
                 lam->fptr = (jl_fptr_t)fptr;

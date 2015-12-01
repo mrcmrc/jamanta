@@ -259,7 +259,17 @@ public:
             new SectionMemoryManager
 #endif
             ) {
-            addOptimizationPasses(&PM);
+#ifdef JULIA_DEBUG_MODE
+            PM.add(createVerifierPass());
+#endif
+            // In imaging mode, we run the pass manager on creation
+            // to make sure it ends up optimized in the shadow module
+            if (!imaging_mode) {
+                addOptimizationPasses(&PM);
+#ifdef JULIA_DEBUG_MODE
+                PM.add(createVerifierPass());
+#endif
+            }
             if (TM.addPassesToEmitMC(PM, Ctx, ObjStream))
                 llvm_unreachable("Target does not support MC emission.");
 

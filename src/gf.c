@@ -318,8 +318,8 @@ jl_lambda_info_t *jl_add_static_parameters(jl_lambda_info_t *l, jl_svec_t *sp, j
         // this might happen if an inner lambda was compiled as part
         // of running an unspecialized function
         nli->fptr = jl_trampoline;
-        nli->functionObject = NULL;
-        nli->specFunctionObject = NULL;
+        nli->functionObjects.functionObject = NULL;
+        nli->functionObjects.specFunctionObject = NULL;
         nli->functionID = 0;
         nli->specFunctionID = 0;
     }
@@ -829,8 +829,8 @@ static jl_function_t *cache_method(jl_methtable_t *mt, jl_tupletype_t *type,
            (newmeth->linfo->specTypes == method->linfo->specTypes) ||
            (newmeth->fptr == &jl_trampoline &&
             newmeth->linfo->fptr == &jl_trampoline &&
-            newmeth->linfo->functionObject == NULL &&
-            newmeth->linfo->specFunctionObject == NULL &&
+            newmeth->linfo->functionObjects.functionObject == NULL &&
+            newmeth->linfo->functionObjects.specFunctionObject == NULL &&
             newmeth->linfo->functionID == 0 &&
             newmeth->linfo->specFunctionID == 0));
 
@@ -1495,7 +1495,7 @@ jl_function_t *jl_get_specialization(jl_function_t *f, jl_tupletype_t *types, vo
         goto not_found;
     }
     if (sf->linfo->inInference) goto not_found;
-    if (sf->linfo->functionObject == NULL) {
+    if (sf->linfo->functionObjects.functionObject == NULL) {
         if (sf->fptr != &jl_trampoline)
             goto not_found;
         jl_compile_linfo(sf->linfo, cyclectx);
