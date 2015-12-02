@@ -184,6 +184,9 @@ namespace llvm {
     extern bool annotateSimdLoop( BasicBlock* latch );
 }
 
+// for image reloading
+static bool imaging_mode = false;
+
 #include "jitlayers.cpp"
 
 #ifdef USE_ORCJIT
@@ -219,9 +222,6 @@ static DataLayoutPass *jl_data_layout;
 #else
 static DataLayout *jl_data_layout;
 #endif
-
-// for image reloading
-static bool imaging_mode = false;
 
 // types
 static Type *T_jlvalue;
