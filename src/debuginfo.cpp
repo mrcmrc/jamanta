@@ -214,6 +214,13 @@ public:
 #ifdef LLVM36
     virtual void NotifyObjectEmitted(const object::ObjectFile &obj,
                                      const RuntimeDyld::LoadedObjectInfo &L)
+    {
+        return _NotifyObjectEmitted(obj,obj,L);
+    }
+
+    virtual void _NotifyObjectEmitted(const object::ObjectFile &obj,
+                                     const object::ObjectFile &debugObj,
+                                     const RuntimeDyld::LoadedObjectInfo &L)
 #else
     virtual void NotifyObjectEmitted(const ObjectImage &obj)
 #endif
@@ -338,7 +345,7 @@ public:
                    (uint8_t*)(intptr_t)Addr, (size_t)Size, sName,
                    (uint8_t*)(intptr_t)SectionAddr, (size_t)SectionSize, UnwindData);
 #endif
-            ObjectInfo tmp = {&obj, (size_t)Size, L.clone().release()};
+            ObjectInfo tmp = {&debugObj, (size_t)Size, L.clone().release()};
             objectmap[Addr] = tmp;
         }
 
