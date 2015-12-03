@@ -72,9 +72,13 @@ function Base.show(io::IO, t::Fail)
     print_with_color(:red, io, "Test Failed\n")
     print(io, "  Expression: ", t.orig_expr)
     if t.test_type == :test_throws
-        # Either no exception, or wrong exception
         print(io, "\n    Expected: ", t.expr)
-        print(io, "\n      Thrown: ", typeof(t.value))
+        # Either no exception, or wrong exception
+        if t.value == nothing
+            print(io, "\n      No exception thrown")
+        else
+            print(io, "\n      Thrown: ", typeof(t.value))
+        end
     elseif !isa(t.expr, Expr)
         # Maybe just a constant, like false
         print(io, "\n   Evaluated: ", t.expr)
