@@ -151,6 +151,11 @@ extern "C" {
   LLVM_ATTRIBUTE_NOINLINE extern void __jit_debug_register_code();
 }
 
+extern DLLEXPORT void ORCNotifyObjectEmitted(JITEventListener *Listener,
+                                      const object::ObjectFile &obj,
+                                      const object::ObjectFile &debugObj,
+                                      const RuntimeDyld::LoadedObjectInfo &L);
+
 namespace {
 
 using namespace llvm;
@@ -225,7 +230,7 @@ public:
                 NotifyGDB(SavedObject);
 
             SavedObjects.push_back(std::move(SavedObject));
-            JuliaListener->NotifyObjectEmitted(*SavedObjects.back().getBinary(),*LO);
+            ORCNotifyObjectEmitted(JuliaListener.get(),*Object,*SavedObjects.back().getBinary(),*LO);
 
             ++oit;
             ++lit;

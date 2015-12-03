@@ -464,6 +464,16 @@ public:
 #endif // USE_MCJIT
 };
 
+#ifdef USE_ORCJIT
+DLLEXPORT void ORCNotifyObjectEmitted(JITEventListener *Listener,
+                                      const object::ObjectFile &obj,
+                                      const object::ObjectFile &debugObj,
+                                      const RuntimeDyld::LoadedObjectInfo &L)
+{
+    ((JuliaJITEventListener*)Listener)->_NotifyObjectEmitted(obj,debugObj,L);
+}
+#endif
+
 extern "C"
 char *jl_demangle(const char *name)
 {
