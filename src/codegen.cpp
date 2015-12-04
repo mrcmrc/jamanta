@@ -1440,6 +1440,7 @@ const jl_value_t *jl_dump_function_ir(void *f, bool strip_ir_metadata, bool dump
         else
             f2->print(stream);
         f2->eraseFromParent();
+        m->dropAllReferences();
         delete m;
     }
 

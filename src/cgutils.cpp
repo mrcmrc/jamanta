@@ -107,6 +107,7 @@ static GlobalValue *realize_pending_global(Instruction *User, GlobalValue *G, st
             FixedGlobals[M] = NewGV;
         } else {
             Function *F = dyn_cast<Function>(G);
+            assert(F);
             //std::cout << "Realizing " << std::string(F->getName()) << std::endl;
             //if (!F->getParent()) {
                 //std::cout << "Skipping" << std::endl;
