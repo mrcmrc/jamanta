@@ -1353,10 +1353,17 @@ void *jl_get_llvmf(jl_function_t *f, jl_tupletype_t *tt, bool getwrapper, bool g
         jl_compile_linfo(linfo, NULL);
     }
     JL_GC_POP();
+    Function *llvmf;
     if (!getwrapper && linfo->functionObjects.specFunctionObject != NULL)
-        return (Function*)linfo->functionObjects.specFunctionObject;
+        llvmf = (Function*)linfo->functionObjects.specFunctionObject;
     else
-        return (Function*)linfo->functionObjects.functionObject;
+        llvmf = (Function*)linfo->functionObjects.functionObject;
+    if (getdeclarations)
+      return llvmf;
+    else {
+      ValueToValueMapTy VMap;
+      return CloneFunction(llvmf,VMap,false);
+    }
 #endif
 }
 

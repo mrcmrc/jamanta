@@ -89,7 +89,7 @@ static Value *runtime_sym_lookup(PointerType *funcptype, const char *f_lib, cons
                *ccall_bb = BasicBlock::Create(jl_LLVMContext, "ccall");
     builder.CreateCondBr(builder.CreateICmpNE(builder.CreateLoad(llvmgv), initnul), ccall_bb, dlsym_lookup);
 
-    assert(ctx->f->getParent() != nullptr);
+    assert(ctx->f->getParent() != NULL);
     ctx->f->getBasicBlockList().push_back(dlsym_lookup);
     builder.SetInsertPoint(dlsym_lookup);
     Value *libname;
