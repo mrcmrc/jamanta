@@ -1306,6 +1306,8 @@ void *jl_get_llvmf(jl_function_t *f, jl_tupletype_t *tt, bool getwrapper, bool g
 
     Function *llvmf = active_module->getFunction(llvmDecl->getName());
     // Not in active module anymore, recompile
+    // Now that in either case, we need to run the FPM manually,
+    // since this is now usually done as part of object emission
     if (!llvmf) {
         Function *other;
         jl_llvm_functions_t declarations;
@@ -1328,8 +1330,7 @@ void *jl_get_llvmf(jl_function_t *f, jl_tupletype_t *tt, bool getwrapper, bool g
         FPM->run(*llvmf);
         llvmf->removeFromParent();
     }
-    // We need to run the FPM manually, since this is now usually done
-    // as part of object emission
+    JL_GC_POP();
     return llvmf;
 #else
     if (linfo->functionObjects.specFunctionObject != NULL) {

@@ -264,14 +264,14 @@ public:
             new SectionMemoryManager
 #endif
             ) {
-#ifdef JULIA_DEBUG_MODE
+#ifdef JL_DEBUG_BUILD
             PM.add(createVerifierPass());
 #endif
             // In imaging mode, we run the pass manager on creation
             // to make sure it ends up optimized in the shadow module
             if (!imaging_mode) {
                 addOptimizationPasses(&PM);
-#ifdef JULIA_DEBUG_MODE
+#ifdef JL_DEBUG_BUILD
                 PM.add(createVerifierPass());
 #endif
             }
