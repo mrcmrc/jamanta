@@ -417,13 +417,12 @@ public:
 
     Value *InjectFunctionProto(Function *F)
     {
-	//return destModule->getOrInsertFunction(F->getName(), F->getFunctionType());
         Function *NewF = destModule->getFunction(F->getName());
         if (!NewF) {
             NewF = function_proto(F);
             destModule->getFunctionList().push_back(NewF);
         }
-	    return NewF;
+        return NewF;
     }
 
 #ifdef LLVM38
