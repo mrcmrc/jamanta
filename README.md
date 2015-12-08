@@ -12,11 +12,11 @@ Windows: [![Build status](https://ci.appveyor.com/api/projects/status/4vr88cmgo7
 Code Coverage: [![Coverage Status](https://coveralls.io/repos/JuliaLang/julia/badge.svg?branch=master)](https://coveralls.io/r/JuliaLang/julia?branch=master) [![codecov.io](http://codecov.io/github/JuliaLang/julia/coverage.svg?branch=master)](http://codecov.io/github/JuliaLang/julia?branch=master)
 
 <a name="The-Julia-Language"/>
-## The Julia Language
+## The Jamanta Language
 
-Julia is a high-level, high-performance dynamic language for technical computing.
-The main homepage for Julia can be found at [julialang.org](http://julialang.org/).
-This is the GitHub repository of Julia source code, including instructions for compiling and installing Julia, below.
+Jamanta is a high-level, high-performance dynamic language for technical computing.
+The main homepage for Jamanta can be found at [julialang.org](http://julialang.org/).
+This is the GitHub repository of Jamanta source code, including instructions for compiling and installing Julia, below.
 
 <a name="Resources"/>
 ## Resources
@@ -34,7 +34,7 @@ This is the GitHub repository of Julia source code, including instructions for c
 The mailing list for developer discussion is
 <http://groups.google.com/group/julia-dev/>. All are welcome, but the volume
 of messages is higher, and the discussions tend to be more esoteric. New
-developers may find the notes in [CONTRIBUTING](https://github.com/JuliaLang/julia/blob/master/CONTRIBUTING.md) helpful to start contributing to the Julia codebase.
+developers may find the notes in [CONTRIBUTING](https://github.com/JuliaLang/julia/blob/master/CONTRIBUTING.md) helpful to start contributing to the Jamata codebase.
 
 ### External Resources
 <a name="External-Resources"/>
